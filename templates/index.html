@@ -2165,9 +2165,15 @@ function app() {
             return result.criteria.reduce((sum, crit) => sum + parseFloat(crit.max || 0), 0);
         },
 getScoreOptions(maxVal) {
+        if (maxVal === 4) return [4, 3, 2, 1, 0];
+        if (maxVal === 3.5) return [3.5, 2.5, 1.5, 0.5, 0];
+        if (maxVal === 5) return [5, 3.5, 2, 0.5, 0];
+        if (maxVal === 2) return [2, 1.5, 1, 0.5, 0];
+        
+        // Fallback genérico por si acaso (aunque los criterios estáticos siempre caerán arriba)
         let opts = [];
-        for(let i = maxVal; i >= 0; i -= 0.5) {
-            if(i >= 0) opts.push(i);
+        for(let i = maxVal; i >= 0; i -= (maxVal/4)) {
+            opts.push(Number(i.toFixed(1)));
         }
         return opts;
       },
