@@ -893,9 +893,10 @@ async def api_hermes_evaluate(request: Request):
             
         # STEP 1: Obtener transcripción (vía YouTube o texto directo manual)
         if url.strip().startswith("http://") or url.strip().startswith("https://"):
-            # En producción, usa la ruta del script relativa
+            import os
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fetch_transcript.py")
             process1 = await asyncio.create_subprocess_exec(
-                "python", "fetch_transcript.py", url.strip(), "--text-only",
+                "python", script_path, url.strip(), "--text-only",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
