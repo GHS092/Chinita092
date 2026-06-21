@@ -891,18 +891,25 @@ async def api_hermes_evaluate(request: Request):
         if not rubric_text or not isinstance(rubric_text, str): 
             return JSONResponse({"error": "No rubric provided or invalid format"}, status_code=400)
             
-        # STEP 1: Extraer transcripción directamente usando el script para evitar alucinaciones y dependencias del modelo LLM
-        process1 = await asyncio.create_subprocess_exec(
-            "python", "/app/fetch_transcript.py", url, "--text-only",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout1, stderr1 = await process1.communicate()
-        transcript_text = stdout1.decode('utf-8').strip()
-        
-        if process1.returncode != 0 or not transcript_text.strip():
-            error_msg = stderr1.decode('utf-8').strip() if stderr1 else transcript_text
-            return JSONResponse({"error": f"Error del extractor: {error_msg}"}, status_code=422)
+        # STEP 1: Obtener transcripción (vía YouTube o texto directo manual)
+        if url.strip().startswith("http://") or url.strip().startswith("https://"):
+            # En producción, usa la ruta del script relativa
+            process1 = await asyncio.create_subprocess_exec(
+                "python", "fetch_transcript.py", url.strip(), "--text-only",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout1, stderr1 = await process1.communicate()
+            transcript_text = stdout1.decode('utf-8').strip()
+            
+            if process1.returncode != 0 or not transcript_text.strip():
+                error_msg = stderr1.decode('utf-8').strip() if stderr1 else transcript_text
+                return JSONResponse({"error": f"Error del extractor: {error_msg}"}, status_code=422)
+        else:
+            # Es un texto directo pegado por el usuario (Bypass)
+            transcript_text = url.strip()
+            if len(transcript_text) < 20:
+                return JSONResponse({"error": "La URL es inválida o el texto de la transcripción es muy corto."}, status_code=400)
 
         # STEP 2: Inyectar texto en el prompt evaluador
         prompt = f'''Analiza el siguiente texto que es la transcripción de un video de YouTube:
