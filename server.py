@@ -893,7 +893,7 @@ async def api_hermes_evaluate(request: Request):
             
         # STEP 1: Extraer transcripción directamente usando el script para evitar alucinaciones y dependencias del modelo LLM
         process1 = await asyncio.create_subprocess_exec(
-            "python", "fetch_transcript.py", url, "--text-only",
+            "python", "/app/fetch_transcript.py", url, "--text-only",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
