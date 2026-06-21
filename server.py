@@ -900,11 +900,9 @@ async def api_hermes_evaluate(request: Request):
         stdout1, stderr1 = await process1.communicate()
         transcript_text = stdout1.decode('utf-8').strip()
         
-        if "bloque" in transcript_text.lower() or "blocked" in transcript_text.lower() or "limitacion" in transcript_text.lower():
-             return JSONResponse({"error": "YouTube bloqueó la extracción o el video no tiene subtítulos. (Intenta en el Chat o usa otro video)."}, status_code=422)
-             
-        if not transcript_text or len(transcript_text) < 10:
-             return JSONResponse({"error": "No se pudo obtener la transcripción del video."}, status_code=422)
+        if process1.returncode != 0 or not transcript_text.strip():
+            error_msg = stderr1.decode('utf-8').strip() if stderr1 else transcript_text
+            return JSONResponse({"error": f"Error del extractor: {error_msg}"}, status_code=422)
 
         # STEP 2: Inyectar texto en el prompt evaluador
         prompt = f'''Analiza el siguiente texto que es la transcripción de un video de YouTube:
