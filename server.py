@@ -926,7 +926,8 @@ INSTRUCCIONES CRÍTICAS, ESTRICTAS Y OBLIGATORIAS:
 1. TIENES PROHIBIDO INVENTAR CRITERIOS O CAMBIAR LOS NOMBRES. Los 6 criterios son ESTÁTICOS e INAMOVIBLES.
 2. Escribe TODA tu respuesta ÚNICAMENTE en Español.
 3. Para cada criterio, elige UNA de las notas permitidas, justifica tu puntuación, lista errores específicos (citas exactas del estudiante) y destaca fortalezas.
-4. Debes devolver ÚNICAMENTE un objeto JSON válido, copiando EXACTAMENTE la estructura de abajo y rellenando los campos indicados con corchetes [ ].
+4. REGLA DE COMPASIÓN: Sé justo pero compasivo. La SUMA TOTAL de los puntajes de los 6 criterios NUNCA debe ser menor a 14 puntos en total. Ajusta los puntajes individuales si es necesario para cumplir esta regla mínima.
+5. Debes devolver ÚNICAMENTE un objeto JSON válido, copiando EXACTAMENTE la estructura de abajo y rellenando los campos indicados con corchetes [ ].
 
 Usa EXACTAMENTE este formato:
 
