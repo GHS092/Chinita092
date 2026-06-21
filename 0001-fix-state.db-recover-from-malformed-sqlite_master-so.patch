@@ -1,0 +1,769 @@
+From 218452b05019e13812a25d1f7a17f798a4b0edf8 Mon Sep 17 00:00:00 2001
+From: brooklyn! <brooklyn.bb.nicholson@gmail.com>
+Date: Tue, 9 Jun 2026 18:49:08 -0500
+Subject: [PATCH] fix(state.db): recover from malformed sqlite_master so hidden
+ sessions reappear (#43149)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* fix(state.db): recover from malformed sqlite_master so hidden sessions reappear
+
+The corruption class behind "Desktop/Dashboard show no sessions while
+hundreds of session files sit on disk" is a malformed sqlite_master — most
+often a duplicate object row, e.g. two CREATE VIRTUAL TABLE messages_fts
+entries — surfacing as:
+
+    sqlite3.DatabaseError: malformed database schema (messages_fts) -
+    table messages_fts already exists
+
+SQLite parses the whole schema while preparing the FIRST statement on a
+connection, so on this class every statement fails before it runs: PRAGMA
+journal_mode (which is where SessionDB.__init__ actually trips, in
+apply_wal_with_fallback, BEFORE _init_schema), PRAGMA integrity_check, and
+even DROP TABLE. The only operations that still work are
+PRAGMA writable_schema=ON plus direct sqlite_master surgery. A plain
+FTS-index rebuild at the _init_schema layer therefore cannot reach or fix
+this; the canonical sessions/messages rows are intact — only the derived
+schema is broken.
+
+Add a dedicated recovery that operates where the failure actually happens:
+
+- hermes_state.repair_state_db_schema(): backs up the raw file first, then a
+  least-destructive ladder — (1) de-duplicate sqlite_master keeping the
+  lowest rowid per object (preserves the existing FTS index), escalating to
+  (2) drop every messages_fts* schema object + VACUUM and let the next open
+  rebuild the FTS index from messages. sessions/messages are never modified.
+  Plus is_malformed_db_error() to discriminate this class.
+- SessionDB.__init__ auto-heals: on a malformed-schema open error it repairs
+  once (process-guarded against loops / concurrent web_server opens) and
+  reopens, so Desktop/Dashboard recover on their own instead of silently
+  showing "no sessions".
+- hermes doctor --fix detects the malformed class and repairs it (reporting
+  the recovered session count + backup name).
+- hermes sessions repair [--check-only] [--no-backup] runs on the raw file
+  path, since SessionDB() itself cannot open a malformed DB.
+
+Supersedes #32589 and #33869: both targeted FTS corruption but gated their
+repair behind statements (integrity_check / SELECT / DROP TABLE) that
+themselves fail on this class, and neither addressed the apply_wal_with_fallback
+open-time failure. Credit preserved via Co-authored-by.
+
+Closes #33865.
+
+Co-authored-by: João Vitor Cunha <145560011+plcunha@users.noreply.github.com>
+Co-authored-by: Tuna Dev <273476039+tuancookiez-hub@users.noreply.github.com>
+
+* test(state.db): cover strat-B escalation + unrepairable safe-fail paths
+
+---------
+
+Co-authored-by: João Vitor Cunha <145560011+plcunha@users.noreply.github.com>
+Co-authored-by: Tuna Dev <273476039+tuancookiez-hub@users.noreply.github.com>
+---
+ hermes_cli/doctor.py                    |  48 ++++-
+ hermes_cli/main.py                      |  70 ++++++-
+ hermes_state.py                         | 266 ++++++++++++++++++++++--
+ tests/test_state_db_malformed_repair.py | 244 ++++++++++++++++++++++
+ 4 files changed, 609 insertions(+), 19 deletions(-)
+ create mode 100644 tests/test_state_db_malformed_repair.py
+
+diff --git a/hermes_cli/doctor.py b/hermes_cli/doctor.py
+index 58f4649..b146722 100644
+--- a/hermes_cli/doctor.py
++++ b/hermes_cli/doctor.py
+@@ -1151,7 +1151,53 @@ def run_doctor(args):
+             conn.close()
+             check_ok(f"{_DHH}/state.db exists ({count} sessions)")
+         except Exception as e:
+-            check_warn(f"{_DHH}/state.db exists but has issues: {e}")
++            from hermes_state import is_malformed_db_error, repair_state_db_schema
++
++            if is_malformed_db_error(e):
++                # sqlite_master itself is malformed (e.g. duplicate
++                # messages_fts) — every statement fails before it runs, so
++                # this is NOT a plain FTS-index rebuild. Repair sqlite_master
++                # in place (backup first; sessions/messages preserved).
++                check_warn(
++                    f"{_DHH}/state.db schema is malformed (sessions hidden until repaired)",
++                    f"({e})",
++                )
++                if should_fix:
++                    report = repair_state_db_schema(state_db_path)
++                    if report.get("repaired"):
++                        try:
++                            conn = sqlite3.connect(str(state_db_path))
++                            count = conn.execute(
++                                "SELECT COUNT(*) FROM sessions"
++                            ).fetchone()[0]
++                            conn.close()
++                        except Exception:
++                            count = "?"
++                        backup_name = (
++                            Path(report["backup_path"]).name
++                            if report.get("backup_path") else "n/a"
++                        )
++                        check_ok(
++                            f"Repaired state.db schema ({count} sessions recovered)",
++                            f"(strategy: {report.get('strategy')}; backup: {backup_name})",
++                        )
++                        fixed_count += 1
++                    else:
++                        check_warn(
++                            "state.db schema repair did not recover automatically",
++                            f"({report.get('error')}; backup: {report.get('backup_path')})",
++                        )
++                        issues.append(
++                            "state.db schema malformed and auto-repair failed — "
++                            "restore from the backup copy beside state.db"
++                        )
++                else:
++                    issues.append(
++                        "state.db schema malformed — run 'hermes doctor --fix' "
++                        "(or 'hermes sessions repair') to recover hidden sessions"
++                    )
++            else:
++                check_warn(f"{_DHH}/state.db exists but has issues: {e}")
+     else:
+         check_info(f"{_DHH}/state.db not created yet (will be created on first session)")
+ 
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index c849f5e..4e775da 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -11185,6 +11185,27 @@ def main():
+         help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)",
+     )
+ 
++    sessions_repair = sessions_subparsers.add_parser(
++        "repair",
++        help="Repair a malformed state.db schema so hidden sessions reappear",
++        description=(
++            "Recover a state.db whose schema is malformed (e.g. 'table "
++            "messages_fts already exists'), which makes Desktop/Dashboard show "
++            "no sessions. A backup is made first; sessions and messages are "
++            "preserved and the FTS search index is rebuilt if needed."
++        ),
++    )
++    sessions_repair.add_argument(
++        "--check-only",
++        action="store_true",
++        help="Only report whether the database opens cleanly; do not modify it",
++    )
++    sessions_repair.add_argument(
++        "--no-backup",
++        action="store_true",
++        help="Skip the timestamped backup copy (not recommended)",
++    )
++
+     sessions_subparsers.add_parser("stats", help="Show session store statistics")
+ 
+     sessions_rename = sessions_subparsers.add_parser(
+@@ -11214,6 +11235,53 @@ def main():
+     def cmd_sessions(args):
+         import json as _json
+ 
++        action = args.sessions_action
++
++        # 'repair' must run BEFORE opening SessionDB(): a malformed schema is
++        # exactly the case where SessionDB() can't open, so it operates on the
++        # raw file path instead.
++        if action == "repair":
++            from hermes_state import (
++                DEFAULT_DB_PATH,
++                _db_opens_cleanly,
++                repair_state_db_schema,
++            )
++
++            db_path = DEFAULT_DB_PATH
++            if not db_path.exists():
++                print(f"No session database at {db_path} (nothing to repair).")
++                return
++            reason = _db_opens_cleanly(db_path)
++            if reason is None:
++                print(f"✓ {db_path} opens cleanly — no repair needed.")
++                return
++            print(f"✗ {db_path} does not open cleanly: {reason}")
++            if getattr(args, "check_only", False):
++                return
++            print("Repairing (a backup copy is made first)…")
++            report = repair_state_db_schema(
++                db_path, backup=not getattr(args, "no_backup", False)
++            )
++            if report.get("repaired"):
++                if report.get("backup_path"):
++                    print(f"  backup: {report['backup_path']}")
++                print(f"  strategy: {report.get('strategy')}")
++                try:
++                    from hermes_state import SessionDB
++
++                    n = SessionDB()._conn.execute(
++                        "SELECT COUNT(*) FROM sessions"
++                    ).fetchone()[0]
++                    print(f"✓ Repaired — {n} sessions recovered.")
++                except Exception:
++                    print("✓ Repaired.")
++            else:
++                print(f"✗ Repair failed: {report.get('error')}")
++                if report.get("backup_path"):
++                    print(f"  A backup is preserved at: {report['backup_path']}")
++                print("  Keep state.db and the backup; do not delete them.")
++            return
++
+         try:
+             from hermes_state import SessionDB
+ 
+@@ -11222,8 +11290,6 @@ def main():
+             print(f"Error: Could not open session database: {e}")
+             return
+ 
+-        action = args.sessions_action
+-
+         # Hide third-party tool sessions by default, but honour explicit --source
+         _source = getattr(args, "source", None)
+         _exclude = None if _source else ["tool"]
+diff --git a/hermes_state.py b/hermes_state.py
+index d83580b..bda6eea 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -226,6 +226,212 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
+         exc,
+     )
+ 
++# ---------------------------------------------------------------------------
++# Malformed-schema recovery
++# ---------------------------------------------------------------------------
++# A distinct, nastier failure class than a malformed FTS *inverted index*:
++# the ``sqlite_master`` schema table itself becomes inconsistent — most
++# commonly a DUPLICATE object definition, e.g. two ``CREATE VIRTUAL TABLE
++# messages_fts`` rows.  SQLite parses the entire schema while preparing the
++# FIRST statement on a connection, so on this class *every* statement raises
++# before it runs — including ``PRAGMA journal_mode`` (which is why this trips
++# in ``apply_wal_with_fallback`` during ``SessionDB.__init__``, long before
++# ``_init_schema`` is reached) and even ``PRAGMA integrity_check`` and a plain
++# ``DROP TABLE``.  The only operations that still work are
++# ``PRAGMA writable_schema=ON`` plus direct ``sqlite_master`` surgery.
++#
++# Symptom users hit (Desktop/Dashboard show "no sessions" while 200+ JSON
++# files sit on disk):
++#   sqlite3.DatabaseError: malformed database schema (messages_fts) -
++#   table messages_fts already exists
++#
++# The canonical ``sessions`` / ``messages`` data is intact in these cases —
++# only the derived schema is broken — so recovery preserves all transcripts
++# and merely rebuilds the FTS layer.
++_MALFORMED_SCHEMA_MARKERS = (
++    "malformed database schema",
++    "database disk image is malformed",
++)
++
++# Process-global guard so auto-repair is attempted at most once per DB path
++# per process (prevents repair loops and serialises concurrent web_server /
++# gateway opens against the same malformed file).
++_repair_attempted_paths: set[str] = set()
++_repair_attempt_lock = threading.Lock()
++
++
++def is_malformed_db_error(exc: BaseException) -> bool:
++    """True if *exc* is a SQLite 'malformed schema / disk image' error.
++
++    These are the corruption classes where the schema fails to parse, so
++    targeted ``sqlite_master`` surgery (not an ordinary FTS rebuild) is the
++    only recovery path.
++    """
++    if not isinstance(exc, sqlite3.DatabaseError):
++        return False
++    return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
++
++
++def _claim_repair_attempt(db_path: Path) -> bool:
++    """Claim the one-shot repair attempt for *db_path* in this process.
++
++    Returns True for the first caller, False afterwards. Keeps a malformed
++    DB from triggering an unbounded repair/reopen loop and stops concurrent
++    callers from racing surgery on the same file.
++    """
++    key = str(db_path)
++    with _repair_attempt_lock:
++        if key in _repair_attempted_paths:
++            return False
++        _repair_attempted_paths.add(key)
++        return True
++
++
++def _backup_db_file(db_path: Path) -> Optional[Path]:
++    """Copy a (possibly malformed) DB file to a timestamped backup beside it.
++
++    Raw file copy on purpose: the DB won't open cleanly, so we preserve the
++    bytes exactly for forensics / manual restore. WAL and SHM sidecars are
++    copied too when present. Returns the backup path, or None on failure.
++    """
++    import datetime
++    import shutil
++
++    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
++    backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
++    try:
++        shutil.copy2(db_path, backup_path)
++        for suffix in ("-wal", "-shm"):
++            sidecar = db_path.with_name(db_path.name + suffix)
++            if sidecar.exists():
++                shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
++        return backup_path
++    except Exception as exc:  # pragma: no cover - best effort
++        logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
++        return None
++
++
++def _db_opens_cleanly(db_path: Path) -> Optional[str]:
++    """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
++
++    Runs the same first-statement (``PRAGMA journal_mode``) that trips the
++    malformed-schema parse, then ``PRAGMA integrity_check`` and a canonical
++    ``sessions`` read.
++    """
++    conn = sqlite3.connect(str(db_path), isolation_level=None)
++    try:
++        conn.execute("PRAGMA journal_mode").fetchone()
++        rows = conn.execute("PRAGMA integrity_check").fetchall()
++        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
++        if problems:
++            return "; ".join(problems[:3])
++        conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
++        return None
++    except sqlite3.DatabaseError as exc:
++        return str(exc)
++    finally:
++        conn.close()
++
++
++def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
++    """Repair a state.db whose ``sqlite_master`` schema is malformed.
++
++    Handles the "duplicate object definition" / malformed-schema class where
++    even ``PRAGMA`` statements fail. Tries least-destructive recovery first
++    and escalates:
++
++      1. **De-duplicate** ``sqlite_master`` (keep the lowest rowid per
++         ``type``/``name``). Fixes the canonical "table X already exists"
++         case and PRESERVES the existing FTS index intact.
++      2. **Drop the FTS schema** (every ``messages_fts*`` object) + ``VACUUM``.
++         The next ``SessionDB()`` open rebuilds the FTS indexes from the
++         canonical ``messages`` table.
++
++    Canonical ``sessions`` / ``messages`` rows are never modified. A
++    timestamped raw backup is taken first unless ``backup=False``.
++
++    Returns a report dict: ``{repaired: bool, strategy: str|None,
++    backup_path: str|None, error: str|None}``.
++    """
++    report: Dict[str, Any] = {
++        "repaired": False,
++        "strategy": None,
++        "backup_path": None,
++        "error": None,
++    }
++
++    db_path = Path(db_path)
++    if not db_path.exists():
++        report["error"] = f"{db_path} does not exist"
++        return report
++
++    if backup:
++        bpath = _backup_db_file(db_path)
++        report["backup_path"] = str(bpath) if bpath else None
++
++    # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
++    try:
++        conn = sqlite3.connect(str(db_path), isolation_level=None)
++        try:
++            conn.execute("PRAGMA writable_schema=ON")
++            dupes = conn.execute(
++                "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
++                "FROM sqlite_master GROUP BY type, name HAVING c > 1"
++            ).fetchall()
++            for type_, name, _count, keep in dupes:
++                conn.execute(
++                    "DELETE FROM sqlite_master "
++                    "WHERE type IS ? AND name IS ? AND rowid <> ?",
++                    (type_, name, keep),
++                )
++            conn.execute("PRAGMA writable_schema=OFF")
++            conn.commit()
++        finally:
++            conn.close()
++        if _db_opens_cleanly(db_path) is None:
++            report["repaired"] = True
++            report["strategy"] = "dedup_schema"
++            logger.warning(
++                "state.db schema repaired by de-duplicating sqlite_master "
++                "(FTS index preserved): %s", db_path
++            )
++            return report
++    except sqlite3.DatabaseError as exc:
++        logger.warning("state.db dedup repair pass failed: %s", exc)
++
++    # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
++    try:
++        conn = sqlite3.connect(str(db_path), isolation_level=None)
++        try:
++            conn.execute("PRAGMA writable_schema=ON")
++            conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
++            conn.execute("PRAGMA writable_schema=OFF")
++            conn.commit()
++            conn.execute("VACUUM")
++        finally:
++            conn.close()
++        reason = _db_opens_cleanly(db_path)
++        if reason is None:
++            report["repaired"] = True
++            report["strategy"] = "drop_fts_rebuild"
++            logger.warning(
++                "state.db schema repaired by dropping FTS schema; indexes "
++                "will rebuild from messages on next open: %s", db_path
++            )
++            return report
++        report["error"] = reason
++    except sqlite3.DatabaseError as exc:
++        report["error"] = str(exc)
++
++    if not report["repaired"]:
++        logger.error(
++            "state.db schema repair could not recover %s automatically "
++            "(backup: %s); manual restore from backup may be required.",
++            db_path, report["backup_path"],
++        )
++    return report
++
++
+ SCHEMA_SQL = """
+ CREATE TABLE IF NOT EXISTS schema_version (
+     version INTEGER NOT NULL
+@@ -405,6 +611,7 @@ class SessionDB:
+         self._write_count = 0
+         self._fts_enabled = False
+         self._fts_unavailable_warned = False
++        self._conn = None
+         try:
+             if read_only:
+                 # Read-only attach for cross-profile aggregation: SELECT-only,
+@@ -426,23 +633,50 @@ class SessionDB:
+                 return
+ 
+             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+-            self._conn = sqlite3.connect(
+-                str(self.db_path),
+-                check_same_thread=False,
+-                # Short timeout — application-level retry with random jitter
+-                # handles contention instead of sitting in SQLite's internal
+-                # busy handler for up to 30s.
+-                timeout=1.0,
+-                # auto-starts transactions on DML, which conflicts with our
+-                # explicit BEGIN IMMEDIATE.  None = we manage transactions
+-                # ourselves.
+-                isolation_level=None,
+-            )
+-            self._conn.row_factory = sqlite3.Row
+-            apply_wal_with_fallback(self._conn, db_label="state.db")
+-            self._conn.execute("PRAGMA foreign_keys=ON")
+ 
+-            self._init_schema()
++            def _connect_and_init():
++                self._conn = sqlite3.connect(
++                    str(self.db_path),
++                    check_same_thread=False,
++                    # Short timeout — application-level retry with random
++                    # jitter handles contention instead of sitting in
++                    # SQLite's internal busy handler for up to 30s.
++                    timeout=1.0,
++                    # auto-starts transactions on DML, which conflicts with
++                    # our explicit BEGIN IMMEDIATE.  None = we manage
++                    # transactions ourselves.
++                    isolation_level=None,
++                )
++                self._conn.row_factory = sqlite3.Row
++                apply_wal_with_fallback(self._conn, db_label="state.db")
++                self._conn.execute("PRAGMA foreign_keys=ON")
++                self._init_schema()
++
++            try:
++                _connect_and_init()
++            except sqlite3.DatabaseError as exc:
++                # The malformed-schema class (e.g. a duplicate sqlite_master
++                # row for messages_fts) fails on the very first statement —
++                # before _init_schema can run — so it can't be caught at the
++                # FTS-rebuild layer. Recover by repairing sqlite_master in
++                # place (backup first; canonical sessions/messages preserved),
++                # then reopen once. This is what lets Desktop/Dashboard
++                # self-heal instead of silently showing "no sessions".
++                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
++                    raise
++                logger.error(
++                    "state.db schema is malformed (%s) — attempting automatic "
++                    "repair (a backup copy is made first).", exc,
++                )
++                try:
++                    if self._conn is not None:
++                        self._conn.close()
++                except Exception:
++                    pass
++                report = repair_state_db_schema(self.db_path)
++                if not report.get("repaired"):
++                    raise
++                _connect_and_init()
+         except Exception as exc:
+             # Capture the cause so /resume and friends can surface WHY the
+             # session DB is unavailable instead of a bare "Session database
+diff --git a/tests/test_state_db_malformed_repair.py b/tests/test_state_db_malformed_repair.py
+new file mode 100644
+index 0000000..8565875
+--- /dev/null
++++ b/tests/test_state_db_malformed_repair.py
+@@ -0,0 +1,244 @@
++"""Recovery from a malformed state.db schema (duplicate sqlite_master rows).
++
++This is the corruption class behind the user-reported symptom where Desktop /
++Dashboard show "no sessions yet" while hundreds of session JSON files sit on
++disk, and the backend logs:
++
++    sqlite3.DatabaseError: malformed database schema (messages_fts) -
++    table messages_fts already exists
++
++The error fires on the *first* statement of any connection (PRAGMA
++journal_mode in apply_wal_with_fallback), before _init_schema runs — so it
++cannot be handled at the FTS-rebuild layer. These tests verify the
++sqlite_master surgery path recovers the canonical data and self-heals on open.
++"""
++import sqlite3
++import uuid
++from pathlib import Path
++
++import pytest
++
++import hermes_state
++from hermes_state import (
++    SessionDB,
++    is_malformed_db_error,
++    repair_state_db_schema,
++)
++
++
++def _build_healthy_db(db_path: Path) -> str:
++    db = SessionDB(db_path=db_path)
++    sid = db.create_session(session_id=str(uuid.uuid4()), source="cli")
++    for i in range(5):
++        db.append_message(sid, role="user", content=f"hello world {i}")
++        db.append_message(sid, role="assistant", content=f"reply about pizza {i}")
++    db.close()
++    return sid
++
++
++def _corrupt_duplicate_fts(db_path: Path) -> None:
++    """Inject a duplicate messages_fts row into sqlite_master.
++
++    Reproduces 'malformed database schema (messages_fts) - table
++    messages_fts already exists'.
++    """
++    conn = sqlite3.connect(str(db_path))
++    conn.execute("PRAGMA writable_schema=ON")
++    conn.execute(
++        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) "
++        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
++        "WHERE name='messages_fts'"
++    )
++    conn.commit()
++    conn.close()
++
++
++def test_duplicate_fts_makes_every_statement_fail(tmp_path):
++    """Document the failure: not even PRAGMA journal_mode survives."""
++    db_path = tmp_path / "state.db"
++    _build_healthy_db(db_path)
++    _corrupt_duplicate_fts(db_path)
++
++    conn = sqlite3.connect(str(db_path))
++    with pytest.raises(sqlite3.DatabaseError) as exc_info:
++        conn.execute("PRAGMA journal_mode").fetchone()
++    conn.close()
++    assert is_malformed_db_error(exc_info.value)
++
++
++def test_repair_preserves_sessions_and_messages(tmp_path):
++    db_path = tmp_path / "state.db"
++    _build_healthy_db(db_path)
++    _corrupt_duplicate_fts(db_path)
++
++    report = repair_state_db_schema(db_path)
++    assert report["repaired"] is True
++    assert report["strategy"] in {"dedup_schema", "drop_fts_rebuild"}
++    # A backup of the malformed file is preserved.
++    assert report["backup_path"] and Path(report["backup_path"]).exists()
++
++    conn = sqlite3.connect(str(db_path))
++    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
++    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
++    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 10
++    conn.close()
++
++
++def test_repaired_db_search_works(tmp_path):
++    db_path = tmp_path / "state.db"
++    _build_healthy_db(db_path)
++    _corrupt_duplicate_fts(db_path)
++    repair_state_db_schema(db_path)
++
++    # Reopen and confirm the FTS index is usable (rebuilt or preserved).
++    db = SessionDB(db_path=db_path)
++    try:
++        hits = db._conn.execute(
++            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'pizza'"
++        ).fetchone()[0]
++        assert hits == 5
++        msg_count = db._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
++        assert msg_count == 10
++    finally:
++        db.close()
++
++
++def test_sessiondb_auto_heals_on_open(tmp_path, monkeypatch):
++    db_path = tmp_path / "state.db"
++    sid = _build_healthy_db(db_path)
++    _corrupt_duplicate_fts(db_path)
++
++    # Fresh process-global guard so the attempt isn't pre-claimed.
++    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
++
++    db = SessionDB(db_path=db_path)
++    try:
++        assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
++        assert db._conn.execute(
++            "SELECT id FROM sessions WHERE id=?", (sid,)
++        ).fetchone() is not None
++    finally:
++        db.close()
++
++
++def test_auto_heal_attempted_once_per_process(tmp_path, monkeypatch):
++    """A still-broken DB must not loop: the second open just raises."""
++    db_path = tmp_path / "state.db"
++    _build_healthy_db(db_path)
++    _corrupt_duplicate_fts(db_path)
++    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
++
++    calls = {"n": 0}
++    real_repair = hermes_state.repair_state_db_schema
++
++    def fake_repair(path, **kw):
++        calls["n"] += 1
++        # Pretend repair failed so the guard's one-shot behavior is exercised.
++        return {"repaired": False, "strategy": None, "backup_path": None, "error": "x"}
++
++    monkeypatch.setattr(hermes_state, "repair_state_db_schema", fake_repair)
++
++    with pytest.raises(sqlite3.DatabaseError):
++        SessionDB(db_path=db_path)
++    with pytest.raises(sqlite3.DatabaseError):
++        SessionDB(db_path=db_path)
++    assert calls["n"] == 1  # repair attempted only once across both opens
++
++    monkeypatch.setattr(hermes_state, "repair_state_db_schema", real_repair)
++
++
++def test_is_malformed_db_error_discriminates():
++    assert is_malformed_db_error(
++        sqlite3.DatabaseError("malformed database schema (messages_fts) - ...")
++    )
++    assert is_malformed_db_error(sqlite3.DatabaseError("database disk image is malformed"))
++    assert not is_malformed_db_error(sqlite3.OperationalError("database is locked"))
++    assert not is_malformed_db_error(ValueError("nope"))
++
++
++def test_strategy_b_rebuild_when_dedup_insufficient(tmp_path, monkeypatch):
++    """If the dedup pass can't fix it, the drop-FTS + rebuild pass must.
++
++    Force strat 1 to be a no-op so the escalation path is exercised against a
++    real malformed file. Data must still survive and search must work.
++    """
++    db_path = tmp_path / "state.db"
++    _build_healthy_db(db_path)
++    _corrupt_duplicate_fts(db_path)
++
++    # Make the post-strat-1 verification report "still broken" exactly once,
++    # so the routine escalates to strat 2 (drop FTS + VACUUM) and runs its
++    # real SQL against the file; the strat-2 verification then uses the real
++    # check and passes.
++    real_check = hermes_state._db_opens_cleanly
++    calls = {"n": 0}
++
++    def flaky_check(path):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            return "pretend strat 1 was insufficient"
++        return real_check(path)
++
++    monkeypatch.setattr(hermes_state, "_db_opens_cleanly", flaky_check)
++    report = repair_state_db_schema(db_path)
++    monkeypatch.undo()
++
++    assert report["repaired"] is True
++    assert report["strategy"] == "drop_fts_rebuild"
++    assert calls["n"] >= 2
++
++    db = SessionDB(db_path=db_path)
++    try:
++        assert db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 10
++        assert db._conn.execute(
++            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'pizza'"
++        ).fetchone()[0] == 5
++    finally:
++        db.close()
++
++
++def test_unrepairable_file_fails_safely(tmp_path, monkeypatch):
++    """A file too damaged to recover must report failure, keep a backup, and
++    never raise from the repair routine itself."""
++    db_path = tmp_path / "state.db"
++    db_path.write_bytes(b"SQLite format 3\x00" + b"\x00\xde\xad\xbe\xef" * 200)
++
++    report = repair_state_db_schema(db_path)
++    assert report["repaired"] is False
++    assert report["error"]
++    # The (damaged) original bytes are preserved for manual restore.
++    assert report["backup_path"] and Path(report["backup_path"]).exists()
++
++
++def test_non_malformed_error_is_not_auto_repaired(tmp_path, monkeypatch):
++    """Auto-heal must only trigger for the malformed-schema class, not for
++    e.g. 'file is not a database' — those raise unchanged."""
++    db_path = tmp_path / "state.db"
++    db_path.write_bytes(b"this is definitely not a sqlite database")
++    monkeypatch.setattr(hermes_state, "_repair_attempted_paths", set())
++
++    called = {"n": 0}
++    orig = hermes_state.repair_state_db_schema
++
++    def spy(*a, **kw):
++        called["n"] += 1
++        return orig(*a, **kw)
++
++    monkeypatch.setattr(hermes_state, "repair_state_db_schema", spy)
++    with pytest.raises(sqlite3.DatabaseError):
++        SessionDB(db_path=db_path)
++    assert called["n"] == 0  # never attempted repair for a non-malformed error
++
++
++def test_repair_on_clean_db_is_noop(tmp_path):
++    """Dedup-keyed repair must not damage a healthy DB if invoked."""
++    db_path = tmp_path / "state.db"
++    _build_healthy_db(db_path)
++
++    report = repair_state_db_schema(db_path, backup=False)
++    assert report["repaired"] is True  # opens cleanly after a no-op dedup
++
++    conn = sqlite3.connect(str(db_path))
++    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 10
++    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
++    conn.close()
+-- 
+2.45.2.windows.1
+

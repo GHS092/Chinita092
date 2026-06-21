@@ -1,0 +1,1581 @@
+"""
+Hermes Agent — Railway admin server.
+
+Responsibilities:
+  - Admin UI / setup wizard at /setup (Starlette + Jinja, cookie-auth guarded)
+  - Management API at /setup/api/* (config, status, logs, gateway, pairing)
+  - Reverse proxy at / and /* → native Hermes dashboard (hermes_cli/web_server, on 127.0.0.1:9119)
+  - Managed subprocesses: `hermes gateway` (agent) and `hermes dashboard` (native UI)
+  - Cookie-based session auth at /login (HMAC-signed, 7-day expiry, httponly)
+
+Auth model: Basic Auth was dropped in favor of cookies because the Hermes React
+SPA's plain fetch() calls do not reliably include basic-auth creds across browsers,
+and basic-auth's per-directory protection space forced separate prompts for
+/setup and /. Cookies auto-include on every same-origin request, so both the
+setup UI and the proxied dashboard work with a single login. The cookie signing
+secret is regenerated on every process start, so any ADMIN_PASSWORD change on
+Railway (which triggers a redeploy) invalidates all existing sessions.
+
+First-visit behavior: if no provider+model config exists, GET / redirects to /setup.
+Once configured, / proxies to the Hermes dashboard. A small "← Setup" widget is
+injected into every proxied HTML response so users can always return to the wizard.
+"""
+
+import asyncio
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+
+WA_PAIRING_PROCESS = None
+from pathlib import Path
+
+import httpx
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
+from starlette.templating import Jinja2Templates
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+ENV_FILE = Path(HERMES_HOME) / ".env"
+PAIRING_DIR = Path(HERMES_HOME) / "pairing"
+PAIRING_TTL = 3600
+
+# Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
+HERMES_DASHBOARD_HOST = "127.0.0.1"
+HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
+HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+
+# Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
+# and `transfer-encoding` (httpx recomputes it from the body). Keep everything
+# else — notably `authorization`, because the SPA uses Bearer tokens against
+# hermes's own /api/env/reveal and OAuth endpoints, and keep `cookie` since
+# some hermes endpoints read it. Aggressive stripping was masking requests in
+# ways that produced spurious 401s.
+HOP_BY_HOP = {"host", "transfer-encoding"}
+
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+if not ADMIN_PASSWORD:
+    ADMIN_PASSWORD = secrets.token_urlsafe(16)
+    print(f"[server] Admin credentials — username: {ADMIN_USERNAME}  password: {ADMIN_PASSWORD}", flush=True)
+else:
+    print(f"[server] Admin username: {ADMIN_USERNAME}", flush=True)
+
+# ── Env var registry ──────────────────────────────────────────────────────────
+# (key, label, category, is_secret)
+ENV_VARS = [
+    ("LLM_MODEL",               "Model",                    "model",     False),
+    ("OPENROUTER_API_KEY",       "OpenRouter",               "provider",  True),
+    ("GEMINI_API_KEY",           "Google Gemini",            "provider",  True),
+    ("DEEPSEEK_API_KEY",         "DeepSeek",                 "provider",  True),
+    ("DASHSCOPE_API_KEY",        "DashScope",                "provider",  True),
+    ("GLM_API_KEY",              "GLM / Z.AI",               "provider",  True),
+    ("KIMI_API_KEY",             "Kimi",                     "provider",  True),
+    ("MINIMAX_API_KEY",          "MiniMax",                  "provider",  True),
+    ("HF_TOKEN",                 "Hugging Face",             "provider",  True),
+    ("NVIDIA_API_KEY",           "NVIDIA",                   "provider",  True),
+    ("PARALLEL_API_KEY",         "Parallel (search)",        "tool",      True),
+    ("FIRECRAWL_API_KEY",        "Firecrawl (scrape)",       "tool",      True),
+    ("TAVILY_API_KEY",           "Tavily (search)",          "tool",      True),
+    ("FAL_KEY",                  "FAL (image gen)",          "tool",      True),
+    ("BROWSERBASE_API_KEY",      "Browserbase key",          "tool",      True),
+    ("BROWSERBASE_PROJECT_ID",   "Browserbase project",      "tool",      False),
+    ("GITHUB_TOKEN",             "GitHub token",             "tool",      True),
+    ("VOICE_TOOLS_OPENAI_KEY",   "OpenAI (voice/TTS)",       "tool",      True),
+    ("HONCHO_API_KEY",           "Honcho (memory)",          "tool",      True),
+    ("TELEGRAM_BOT_TOKEN",       "Bot Token",                "telegram",  True),
+    ("TELEGRAM_ALLOWED_USERS",   "Allowed User IDs",         "telegram",  False),
+    ("DISCORD_BOT_TOKEN",        "Bot Token",                "discord",   True),
+    ("DISCORD_ALLOWED_USERS",    "Allowed User IDs",         "discord",   False),
+    ("SLACK_BOT_TOKEN",          "Bot Token (xoxb-...)",     "slack",     True),
+    ("SLACK_APP_TOKEN",          "App Token (xapp-...)",     "slack",     True),
+    ("WHATSAPP_ENABLED",         "Enable WhatsApp",          "whatsapp",  False),
+    ("WHATSAPP_MODE",            "Mode (self-chat or bot)",  "whatsapp",  False),
+    ("WHATSAPP_ALLOWED_USERS",   "Allowed User IDs (* for all)","whatsapp",False),
+    ("EMAIL_ADDRESS",            "Email Address",            "email",     False),
+    ("EMAIL_PASSWORD",           "Email Password",           "email",     True),
+    ("EMAIL_IMAP_HOST",          "IMAP Host",                "email",     False),
+    ("EMAIL_SMTP_HOST",          "SMTP Host",                "email",     False),
+    ("MATTERMOST_URL",           "Server URL",               "mattermost",False),
+    ("MATTERMOST_TOKEN",         "Bot Token",                "mattermost",True),
+    ("MATRIX_HOMESERVER",        "Homeserver URL",           "matrix",    False),
+    ("MATRIX_ACCESS_TOKEN",      "Access Token",             "matrix",    True),
+    ("MATRIX_USER_ID",           "User ID",                  "matrix",    False),
+    ("GATEWAY_ALLOW_ALL_USERS",  "Allow all users",          "gateway",   False),
+    ("ADMIN_USERNAME",           "Admin username",           "admin",     False),
+    ("ADMIN_PASSWORD",           "Admin password",           "admin",     True),
+    ("TERMINAL_BACKEND",         "Execution Backend (local/modal)", "terminal", False),
+    ("MODAL_TOKEN_ID",           "Modal Token ID",           "terminal",  True),
+    ("MODAL_TOKEN_SECRET",       "Modal Token Secret",       "terminal",  True),
+]
+
+SECRET_KEYS  = {k for k, _, _, s in ENV_VARS if s}
+PROVIDER_KEYS = [k for k, _, c, _ in ENV_VARS if c == "provider"]
+
+# Lightweight test endpoint for each provider — hits a cheap read-only endpoint
+# (usually /models) to verify the key is accepted. Returns 200 if valid.
+PROVIDER_TEST_CONFIGS: dict[str, dict] = {
+    "OPENROUTER_API_KEY": {"url": "https://openrouter.ai/api/v1/models",                     "auth": "Bearer"},
+    "GEMINI_API_KEY":     {"url": "https://generativelanguage.googleapis.com/v1beta/models", "auth": "x-goog-api-key"},
+    "DEEPSEEK_API_KEY":   {"url": "https://api.deepseek.com/models",                          "auth": "Bearer"},
+    "DASHSCOPE_API_KEY":  {"url": "https://dashscope.aliyuncs.com/compatible-mode/v1/models", "auth": "Bearer"},
+    "GLM_API_KEY":        {"url": "https://open.bigmodel.cn/api/paas/v4/models",               "auth": "Bearer"},
+    "KIMI_API_KEY":       {"url": "https://api.moonshot.cn/v1/models",                         "auth": "Bearer"},
+    "MINIMAX_API_KEY":    {"url": "https://api.minimaxi.chat/v1/models",                       "auth": "Bearer"},
+    "HF_TOKEN":           {"url": "https://huggingface.co/api/whoami-v2",                      "auth": "Bearer"},
+    "NVIDIA_API_KEY":     {"url": "https://integrate.api.nvidia.com/v1/models",                "auth": "Bearer"},
+}
+CHANNEL_MAP  = {
+    "Telegram":    "TELEGRAM_BOT_TOKEN",
+    "Discord":     "DISCORD_BOT_TOKEN",
+    "Slack":       "SLACK_BOT_TOKEN",
+    "WhatsApp":    "WHATSAPP_ENABLED",
+    "Email":       "EMAIL_ADDRESS",
+    "Mattermost":  "MATTERMOST_TOKEN",
+    "Matrix":      "MATRIX_ACCESS_TOKEN",
+}
+
+
+# ── .env helpers ──────────────────────────────────────────────────────────────
+def read_env(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    out = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
+def write_config_yaml(data: dict):
+    model = data.get("LLM_MODEL", "").strip()
+    backend = data.get("TERMINAL_BACKEND", "local").strip().lower()
+    
+    if backend == "modal":
+        terminal_block = """  backend: "modal"
+  timeout: 180
+  lifetime_seconds: 300
+  modal_image: "nikolaik/python-nodejs:python3.11-nodejs20"
+"""
+    else:
+        terminal_block = """  backend: "local"
+  timeout: 60
+  cwd: "/tmp"
+"""
+    # --- DETERMINE PROVIDER ---
+    provider_slug = "auto"
+    selected_key = data.get("SELECTED_PROVIDER_KEY")
+    gemini_key = data.get("GEMINI_API_KEY", "")
+    or_key = data.get("OPENROUTER_API_KEY", "")
+
+    if selected_key == "GEMINI_API_KEY" and "," in gemini_key:
+        provider_slug = "custom"
+        port = os.environ.get("PORT", "8080")
+        base_url_line = f'  base_url: "http://127.0.0.1:{port}/proxy/gemini/v1"\n'
+    elif selected_key == "OPENROUTER_API_KEY" and "," in or_key:
+        provider_slug = "custom"
+        port = os.environ.get("PORT", "8080")
+        base_url_line = f'  base_url: "http://127.0.0.1:{port}/proxy/openrouter"\n'
+    elif selected_key:
+        mapping = {
+            "OPENROUTER_API_KEY": "openrouter",
+            "GEMINI_API_KEY": "gemini",
+            "DEEPSEEK_API_KEY": "deepseek",
+            "DASHSCOPE_API_KEY": "dashscope",
+            "GLM_API_KEY": "glm",
+            "KIMI_API_KEY": "kimi",
+            "MINIMAX_API_KEY": "minimax",
+            "HF_TOKEN": "hf",
+            "NVIDIA_API_KEY": "nvidia",
+        }
+        provider_slug = mapping.get(selected_key, "auto")
+        base_url_line = ""
+    else:
+        base_url_line = ""
+
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(f"""\
+model:
+  default: "{model}"
+  provider: "{provider_slug}"
+{base_url_line}
+terminal:
+{terminal_block}
+agent:
+  max_iterations: 50
+
+data_dir: "{HERMES_HOME}"
+""")
+
+
+def write_env(path: Path, data: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cat_order = ["model", "provider", "tool", "terminal",
+                 "telegram", "discord", "slack", "whatsapp",
+                 "email", "mattermost", "matrix", "gateway"]
+    cat_labels = {
+        "model": "Model", "provider": "Providers", "tool": "Tools",
+        "terminal": "Terminal / Modal",
+        "telegram": "Telegram", "discord": "Discord", "slack": "Slack",
+        "whatsapp": "WhatsApp", "email": "Email",
+        "mattermost": "Mattermost", "matrix": "Matrix", "gateway": "Gateway",
+    }
+    key_cat = {k: c for k, _, c, _ in ENV_VARS}
+    grouped: dict[str, list[str]] = {c: [] for c in cat_order}
+    grouped["other"] = []
+
+    for k, v in data.items():
+        if not v:
+            continue
+        cat = key_cat.get(k, "other")
+        grouped.setdefault(cat, []).append(f"{k}={v}")
+
+    lines: list[str] = []
+    for cat in cat_order:
+        entries = sorted(grouped.get(cat, []))
+        if entries:
+            lines.append(f"# {cat_labels.get(cat, cat)}")
+            lines.extend(entries)
+            lines.append("")
+    if grouped["other"]:
+        lines.append("# Other")
+        lines.extend(sorted(grouped["other"]))
+        lines.append("")
+
+    path.write_text("\n".join(lines))
+
+
+def is_config_complete(data: dict[str, str] | None = None) -> bool:
+    """Single source of truth for 'ready to run the gateway'.
+
+    Used by: GET / redirect, auto_start on boot, admin API status.
+    """
+    if data is None:
+        data = read_env(ENV_FILE)
+    has_model = bool(data.get("LLM_MODEL"))
+    has_provider = any(data.get(k) for k in PROVIDER_KEYS)
+    return has_model and has_provider
+
+
+def mask(data: dict[str, str]) -> dict[str, str]:
+    return {
+        k: (v[:8] + "***" if len(v) > 8 else "***") if k in SECRET_KEYS and v else v
+        for k, v in data.items()
+    }
+
+
+def unmask(new: dict[str, str], existing: dict[str, str]) -> dict[str, str]:
+    return {
+        k: (existing.get(k, "") if k in SECRET_KEYS and v.endswith("***") else v)
+        for k, v in new.items()
+    }
+
+
+# ── Auth (cookie-based) ───────────────────────────────────────────────────────
+# We use HMAC-signed cookies instead of HTTP Basic Auth because:
+#   1. Basic auth's per-directory protection space means browsers cache creds
+#      for /setup/* separately from /*, forcing re-prompt on navigation.
+#   2. Browser behavior for sending Basic auth on XHR/fetch is inconsistent;
+#      the Hermes React SPA's plain fetch() calls don't reliably include it,
+#      causing every proxied API call to 401.
+# Cookies are auto-included on every same-origin request (navigation + XHR)
+# so both the setup UI and the proxied Hermes dashboard work with one login.
+#
+# The SECRET is regenerated on every process start. That means any ADMIN_PASSWORD
+# change via Railway → redeploy → all existing cookies invalidate → users re-login.
+import hashlib as _hashlib
+import hmac as _hmac
+from urllib.parse import quote as _url_quote, urlparse as _urlparse
+
+COOKIE_NAME = "hermes_auth"
+COOKIE_MAX_AGE = 7 * 86400  # 7 days
+COOKIE_SECRET = secrets.token_bytes(32)
+
+# Public paths — no auth required. Everything else is behind the cookie gate.
+PUBLIC_PATHS = {"/health", "/login", "/logout"}
+
+
+def _make_auth_token() -> str:
+    """Build a cookie value: `<expires>.<hmac-sha256>`."""
+    expires = str(int(time.time()) + COOKIE_MAX_AGE)
+    sig = _hmac.new(COOKIE_SECRET, expires.encode(), _hashlib.sha256).hexdigest()
+    return f"{expires}.{sig}"
+
+
+def _verify_auth_token(token: str) -> bool:
+    try:
+        expires_s, sig = token.rsplit(".", 1)
+        if int(expires_s) < time.time():
+            return False
+        expected = _hmac.new(COOKIE_SECRET, expires_s.encode(), _hashlib.sha256).hexdigest()
+        return _hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
+
+
+def _is_authenticated(request: Request) -> bool:
+    return _verify_auth_token(request.cookies.get(COOKIE_NAME, ""))
+
+
+def _safe_return_to(value: str) -> str:
+    """Reject open-redirect attempts — only allow same-origin relative paths."""
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return "/"
+    # Strip any scheme/netloc that slipped through.
+    p = _urlparse(value)
+    if p.scheme or p.netloc:
+        return "/"
+    return value
+
+
+def guard(request: Request) -> Response | None:
+    """Enforce auth on protected routes.
+
+    - HTML navigation: 302 to /login?returnTo=<path>
+    - API / XHR: 401 JSON (so the SPA's fetch() can surface it cleanly)
+    """
+    if _is_authenticated(request):
+        return None
+    accept = request.headers.get("accept", "").lower()
+    wants_html = "text/html" in accept
+    if wants_html:
+        rt = request.url.path
+        if request.url.query:
+            rt = f"{rt}?{request.url.query}"
+        return RedirectResponse(f"/login?returnTo={_url_quote(rt)}", status_code=302)
+    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+
+LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hermes Agent — Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d0f14;color:#c9d1d9;font-family:'IBM Plex Sans',sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#14181f;border:1px solid #252d3d;border-radius:12px;padding:36px 32px;width:100%;max-width:380px;
+  box-shadow:0 20px 40px rgba(0,0,0,0.4)}
+.brand{text-align:center;margin-bottom:28px}
+.brand-logo{display:inline-flex;align-items:center;gap:10px;font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:18px;color:#6272ff}
+.brand-logo span{color:#6b7688;font-weight:400}
+.brand-sub{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#6b7688;margin-top:8px;letter-spacing:1.5px;text-transform:uppercase}
+label{display:block;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#6b7688;
+  letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px;margin-top:16px}
+input{width:100%;background:#0d0f14;border:1px solid #252d3d;border-radius:6px;color:#c9d1d9;
+  font-family:'IBM Plex Mono',monospace;font-size:13px;padding:9px 11px;outline:none;transition:border-color .15s}
+input:focus{border-color:#6272ff}
+button{width:100%;margin-top:24px;background:#6272ff;border:1px solid #6272ff;border-radius:6px;color:#fff;
+  font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500;padding:10px;cursor:pointer;
+  transition:background .15s,border-color .15s}
+button:hover{background:#7b8fff;border-color:#7b8fff}
+.err{background:rgba(248,81,73,0.08);border:1px solid rgba(248,81,73,0.3);border-radius:6px;
+  color:#f85149;font-family:'IBM Plex Mono',monospace;font-size:12px;padding:8px 12px;margin-bottom:14px;text-align:center}
+.footnote{margin-top:18px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:#6b7688;text-align:center;line-height:1.6}
+</style></head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="brand-logo">hermes<span>/admin</span></div>
+    <div class="brand-sub">Sign in to continue</div>
+  </div>
+  __ERROR__
+  <form method="POST" action="/login">
+    <input type="hidden" name="returnTo" value="__RETURN_TO__">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username" autofocus required>
+    <label for="password">Password</label>
+    <div style="position:relative; display:flex; align-items:center;">
+      <input id="password" name="password" type="password" autocomplete="current-password" required style="padding-right:36px;">
+      <button type="button" onclick="var p=document.getElementById('password'); var t=p.type==='password'; p.type=t?'text':'password'; this.children[0].style.display=t?'none':'block'; this.children[1].style.display=t?'block':'none';" style="position:absolute; right:8px; background:none; border:none; cursor:pointer; color:#6b7688; display:flex; align-items:center; justify-content:center; padding:4px; margin-top:0; width:auto;" title="Toggle visibility">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+        <svg style="display:none" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>
+      </button>
+    </div>
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="footnote">Credentials are the <code>ADMIN_USERNAME</code> and <code>ADMIN_PASSWORD</code><br>Railway service variables.</p>
+</div>
+</body></html>"""
+
+
+def _html_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&#39;"))
+
+
+async def page_login(request: Request) -> Response:
+    """GET /login — render the sign-in form."""
+    # Already signed in? Bounce to returnTo (or /).
+    if _is_authenticated(request):
+        return RedirectResponse(_safe_return_to(request.query_params.get("returnTo", "/")), status_code=302)
+    rt = _safe_return_to(request.query_params.get("returnTo", "/"))
+    error_html = ('<div class="err">Invalid username or password</div>'
+                  if request.query_params.get("error") else "")
+    html = (LOGIN_PAGE_HTML
+            .replace("__ERROR__", error_html)
+            .replace("__RETURN_TO__", _html_escape(rt)))
+    return HTMLResponse(html)
+
+
+async def login_post(request: Request) -> Response:
+    """POST /login — validate creds and set the auth cookie."""
+    form = await request.form()
+    username = str(form.get("username", ""))
+    password = str(form.get("password", ""))
+    return_to = _safe_return_to(str(form.get("returnTo", "/")))
+
+    valid_user = _hmac.compare_digest(username, ADMIN_USERNAME)
+    valid_pw = _hmac.compare_digest(password, ADMIN_PASSWORD)
+    if valid_user and valid_pw:
+        resp = RedirectResponse(return_to, status_code=302)
+        resp.set_cookie(
+            COOKIE_NAME,
+            _make_auth_token(),
+            max_age=COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return resp
+    return RedirectResponse(f"/login?returnTo={_url_quote(return_to)}&error=1", status_code=302)
+
+
+async def logout(request: Request) -> Response:
+    """GET /logout — clear cookie and bounce to login."""
+    resp = RedirectResponse("/login", status_code=302)
+    resp.delete_cookie(COOKIE_NAME, path="/")
+    return resp
+
+
+# ── Gateway manager ───────────────────────────────────────────────────────────
+class Gateway:
+    def __init__(self):
+        self.proc: asyncio.subprocess.Process | None = None
+        self.state = "stopped"
+        self.logs: deque[str] = deque(maxlen=500)
+        self.started_at: float | None = None
+        self.restarts = 0
+
+    async def start(self):
+        if self.proc and self.proc.returncode is None:
+            return
+        self.state = "starting"
+        try:
+            # .env values take priority over Railway env vars.
+            # We build the env this way so hermes's own dotenv loading
+            # (which reads the same file) doesn't shadow our values.
+            env = {**os.environ, "HERMES_HOME": HERMES_HOME}
+            env.update(read_env(ENV_FILE))
+            
+            # --- ISOLATE SELECTED PROVIDER ---
+            selected_key = env.get("SELECTED_PROVIDER_KEY")
+            if selected_key:
+                for k in PROVIDER_KEYS:
+                    if k != selected_key and k in env:
+                        env.pop(k)
+
+            # --- AUTOMATIC CAROUSEL UPGRADE ---
+            gemini_key = env.get("GEMINI_API_KEY", "")
+            if gemini_key and "," in gemini_key:
+                env["USE_GEMINI_CAROUSEL"] = "true"
+                env["GEMINI_CAROUSEL_KEYS"] = gemini_key
+
+            or_key = env.get("OPENROUTER_API_KEY", "")
+            if or_key and "," in or_key:
+                env["USE_OPENROUTER_CAROUSEL"] = "true"
+                env["OPENROUTER_CAROUSEL_KEYS"] = or_key
+
+            # --- GEMINI CAROUSEL INTERCEPT ---
+            if env.get("USE_GEMINI_CAROUSEL", "").lower() in ("true", "1", "yes"):
+                port = os.environ.get("PORT", "8080")
+                env["OPENAI_API_KEY"] = "carousel-dummy-key"
+                env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{port}/proxy/gemini/v1"
+                for k in PROVIDER_KEYS:
+                    if k not in ("GEMINI_CAROUSEL_KEYS", "USE_GEMINI_CAROUSEL"):
+                        env.pop(k, None)
+            
+            # --- OPENROUTER CAROUSEL INTERCEPT ---
+            elif env.get("USE_OPENROUTER_CAROUSEL", "").lower() in ("true", "1", "yes"):
+                port = os.environ.get("PORT", "8080")
+                env["OPENAI_API_KEY"] = "carousel-dummy-key"
+                env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{port}/proxy/openrouter"
+                for k in PROVIDER_KEYS:
+                    if k not in ("OPENROUTER_CAROUSEL_KEYS", "USE_OPENROUTER_CAROUSEL"):
+                        env.pop(k, None)
+            
+            model = env.get("LLM_MODEL", "")
+            provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
+            print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
+            # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
+            write_config_yaml(read_env(ENV_FILE))
+            self.proc = await asyncio.create_subprocess_exec(
+                "hermes", "gateway",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            self.state = "running"
+            self.started_at = time.time()
+            asyncio.create_task(self._drain())
+        except Exception as e:
+            self.state = "error"
+            self.logs.append(f"[error] Failed to start: {e}")
+
+    async def stop(self):
+        if not self.proc or self.proc.returncode is not None:
+            self.state = "stopped"
+            return
+        self.state = "stopping"
+        self.proc.terminate()
+        try:
+            await asyncio.wait_for(self.proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            self.proc.kill()
+            await self.proc.wait()
+        self.state = "stopped"
+        self.started_at = None
+
+    async def restart(self):
+        await self.stop()
+        self.restarts += 1
+        await self.start()
+
+    async def _drain(self):
+        assert self.proc and self.proc.stdout
+        async for raw in self.proc.stdout:
+            line = ANSI_ESCAPE.sub("", raw.decode(errors="replace").rstrip())
+            self.logs.append(line)
+        if self.state == "running":
+            self.state = "error"
+            self.logs.append(f"[error] Gateway exited (code {self.proc.returncode})")
+
+    def status(self) -> dict:
+        uptime = int(time.time() - self.started_at) if self.started_at and self.state == "running" else None
+        return {
+            "state":    self.state,
+            "pid":      self.proc.pid if self.proc and self.proc.returncode is None else None,
+            "uptime":   uptime,
+            "restarts": self.restarts,
+        }
+
+
+gw = Gateway()
+cfg_lock = asyncio.Lock()
+
+
+# ── Hermes dashboard subprocess ───────────────────────────────────────────────
+class Dashboard:
+    """Manages the `hermes dashboard` subprocess (native Hermes web UI).
+
+    Bound to loopback only — we expose it to the public internet through our
+    reverse proxy on $PORT, where edge basic auth guards every request.
+    The dashboard is independent of the gateway: it reads config files
+    directly and tolerates a stopped gateway.
+
+    All subprocess output is streamed to our stdout (→ Railway logs) with a
+    `[dashboard]` prefix AND retained in a ring buffer for diagnostics.
+    Unexpected exits are explicitly logged with their return code.
+    """
+
+    def __init__(self):
+        self.proc: asyncio.subprocess.Process | None = None
+        self.logs: deque[str] = deque(maxlen=300)
+        self._drain_task: asyncio.Task | None = None
+
+    async def start(self):
+        if self.proc and self.proc.returncode is None:
+            return
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                "hermes", "dashboard",
+                "--host", HERMES_DASHBOARD_HOST,
+                "--port", str(HERMES_DASHBOARD_PORT),
+                "--no-open",
+                "--tui",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
+            self._drain_task = asyncio.create_task(self._drain())
+        except Exception as e:
+            print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
+
+    async def _drain(self):
+        """Stream subprocess output to Railway logs (prefixed) and a ring buffer."""
+        assert self.proc and self.proc.stdout
+        try:
+            async for raw in self.proc.stdout:
+                line = ANSI_ESCAPE.sub("", raw.decode(errors="replace").rstrip())
+                self.logs.append(line)
+                print(f"[dashboard] {line}", flush=True)
+        except Exception as e:
+            print(f"[dashboard] drain error: {e!r}", flush=True)
+        finally:
+            rc = self.proc.returncode if self.proc else None
+            if rc is not None and rc != 0:
+                print(f"[dashboard] EXITED with code {rc} — reverse proxy will return 503 until restart", flush=True)
+            elif rc == 0:
+                print(f"[dashboard] exited cleanly (code 0)", flush=True)
+
+    async def stop(self):
+        if not self.proc or self.proc.returncode is not None:
+            return
+        self.proc.terminate()
+        try:
+            await asyncio.wait_for(self.proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            self.proc.kill()
+            await self.proc.wait()
+
+
+dash = Dashboard()
+
+# Shared async HTTP client for the reverse proxy. Created lazily so we pick up
+# the running event loop, torn down in lifespan.
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=5.0),
+            follow_redirects=False,
+        )
+    return _http_client
+
+
+from starlette.responses import StreamingResponse
+
+CAROUSEL_INDEX = 0
+
+async def openai_proxy(request: Request):
+    global CAROUSEL_INDEX
+    
+    data = read_env(ENV_FILE)
+    keys_str = data.get("GEMINI_API_KEY", "")
+    keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    
+    if not keys:
+        return JSONResponse({"error": "No Gemini keys configured"}, status_code=500)
+    
+    body_bytes = await request.body()
+    try:
+        body_data = json.loads(body_bytes)
+        if "max_tokens" in body_data and body_data["max_tokens"] > 4096:
+            body_data["max_tokens"] = 4096
+            body_bytes = json.dumps(body_data).encode("utf-8")
+    except Exception:
+        pass
+    path = request.url.path.replace("/proxy/gemini", "")
+    if path.startswith("/v1/"):
+        path = path[3:]
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"https://generativelanguage.googleapis.com/v1beta/openai{path}"
+    
+    client = get_http_client()
+    
+    for attempt in range(len(keys)):
+        current_key = keys[CAROUSEL_INDEX % len(keys)]
+        
+        headers = dict(request.headers)
+        for h in HOP_BY_HOP:
+            headers.pop(h, None)
+        headers.pop("authorization", None)
+        headers.pop("Authorization", None)
+        
+        # Gemini expects 'Bearer <key>' on its OpenAI compat endpoint
+        headers["Authorization"] = f"Bearer {current_key}"
+        headers["Host"] = "generativelanguage.googleapis.com"
+        
+        req = client.build_request(request.method, url, headers=headers, content=body_bytes)
+        resp = await client.send(req, stream=True)
+        
+        if resp.status_code in (429, 402, 403, 401):
+            print(f"[carousel] Key {current_key[:8]}*** returned {resp.status_code}. Rotating.", flush=True)
+            CAROUSEL_INDEX += 1
+            await resp.aclose()
+            continue
+            
+        async def stream_gen():
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+            await resp.aclose()
+            
+        response_headers = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() not in HOP_BY_HOP
+            and k.lower() not in ("content-encoding", "content-length")
+        }
+            
+        return StreamingResponse(stream_gen(), status_code=resp.status_code, headers=response_headers)
+        
+    return JSONResponse({"error": "All Gemini keys exhausted"}, status_code=429)
+
+OR_CAROUSEL_INDEX = 0
+
+async def openrouter_proxy(request: Request):
+    global OR_CAROUSEL_INDEX
+    
+    data = read_env(ENV_FILE)
+    keys_str = data.get("OPENROUTER_API_KEY", "")
+    keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    
+    if not keys:
+        return JSONResponse({"error": "No OpenRouter keys configured"}, status_code=500)
+    
+    body_bytes = await request.body()
+    try:
+        body_data = json.loads(body_bytes)
+        if "max_tokens" in body_data and body_data["max_tokens"] > 4096:
+            body_data["max_tokens"] = 4096
+            body_bytes = json.dumps(body_data).encode("utf-8")
+    except Exception:
+        pass
+    path = request.url.path.replace("/proxy/openrouter", "")
+    if not path.startswith("/"):
+        path = "/" + path
+    # OpenRouter API uses /api/v1/chat/completions. If liteLLM already added /v1, strip it.
+    if path.startswith("/v1/"):
+        path = path[3:]
+    url = f"https://openrouter.ai/api/v1{path}"
+    
+    client = get_http_client()
+    
+    for attempt in range(len(keys)):
+        current_key = keys[OR_CAROUSEL_INDEX % len(keys)]
+        
+        headers = dict(request.headers)
+        for h in HOP_BY_HOP:
+            headers.pop(h, None)
+        headers.pop("authorization", None)
+        headers.pop("Authorization", None)
+        
+        headers["Authorization"] = f"Bearer {current_key}"
+        headers["Host"] = "openrouter.ai"
+        
+        req = client.build_request(request.method, url, headers=headers, content=body_bytes)
+        resp = await client.send(req, stream=True)
+        
+        if resp.status_code in (429, 402, 403, 401):
+            print(f"[carousel] OR Key {current_key[:8]}*** returned {resp.status_code}. Rotating.", flush=True)
+            OR_CAROUSEL_INDEX += 1
+            await resp.aclose()
+            continue
+            
+        async def stream_gen():
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+            await resp.aclose()
+            
+        response_headers = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() not in HOP_BY_HOP
+            and k.lower() not in ("content-encoding", "content-length")
+        }
+            
+        return StreamingResponse(stream_gen(), status_code=resp.status_code, headers=response_headers)
+        
+    return JSONResponse({"error": "All OpenRouter keys exhausted"}, status_code=429)
+
+# ── Route handlers ────────────────────────────────────────────────────────────
+async def page_index(request: Request):
+    if err := guard(request): return err
+    return templates.TemplateResponse(request, "index.html")
+
+
+async def route_health(request: Request):
+    return JSONResponse({"status": "ok", "gateway": gw.state})
+
+
+async def api_config_get(request: Request):
+    if err := guard(request): return err
+    async with cfg_lock:
+        data = read_env(ENV_FILE)
+    defs = [{"key": k, "label": l, "category": c, "secret": s} for k, l, c, s in ENV_VARS]
+    return JSONResponse({"vars": mask(data), "defs": defs})
+
+
+async def api_config_put(request: Request):
+    if err := guard(request): return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    try:
+        restart = body.pop("_restart", False)
+        new_vars = body.get("vars", {})
+        async with cfg_lock:
+            existing = read_env(ENV_FILE)
+            merged = unmask(new_vars, existing)
+            for k, v in existing.items():
+                if k not in merged:
+                    merged[k] = v
+                    
+            # CRITICAL: Hermes auto-detects providers based on the mere presence 
+            # of a key in the .env file. If a key is an empty string, we MUST delete it 
+            # entirely so Hermes doesn't try to use an empty key and crash with 401.
+            keys_to_delete = [k for k, v in merged.items() if not str(v).strip()]
+            for k in keys_to_delete:
+                del merged[k]
+                
+            write_env(ENV_FILE, merged)
+            write_config_yaml(merged)
+        if restart:
+            asyncio.create_task(gw.restart())
+        return JSONResponse({"ok": True, "restarting": restart})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+
+
+async def api_hermes_chat(request: Request):
+    try:
+        body = await request.json()
+        message = body.get("message")
+        if not message: return JSONResponse({"error": "No message provided"}, status_code=400)
+        
+        process = await asyncio.create_subprocess_exec(
+            "hermes", "-s", "youtube-content", "-z", message,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        out = stdout.decode('utf-8').strip()
+        
+        if process.returncode != 0:
+            err = stderr.decode('utf-8').strip()
+            return JSONResponse({"error": "Hermes failed", "details": err}, status_code=500)
+            
+        return JSONResponse({"response": out})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+import asyncio
+async def api_hermes_evaluate(request: Request):
+    try:
+        body = await request.json()
+        url = body.get("url")
+        rubric_text = body.get("rubric", "")
+        
+        if not url: return JSONResponse({"error": "No URL provided"}, status_code=400)
+        if not rubric_text or not isinstance(rubric_text, str): 
+            return JSONResponse({"error": "No rubric provided or invalid format"}, status_code=400)
+            
+        # STEP 1: Extraer transcripción primero para evitar alucinaciones del modelo
+        fetch_prompt = f"Extrae TODA la transcripción de este video y devuélvela como texto plano: {url}"
+        process1 = await asyncio.create_subprocess_exec(
+            "hermes", "-s", "youtube-content", "-z", fetch_prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout1, stderr1 = await process1.communicate()
+        transcript_text = stdout1.decode('utf-8').strip()
+        
+        if "bloque" in transcript_text.lower() or "blocked" in transcript_text.lower() or "limitacion" in transcript_text.lower():
+             return JSONResponse({"error": "YouTube bloqueó la extracción o el video no tiene subtítulos. (Intenta en el Chat o usa otro video)."}, status_code=422)
+             
+        if not transcript_text or len(transcript_text) < 10:
+             return JSONResponse({"error": "No se pudo obtener la transcripción del video."}, status_code=422)
+
+        # STEP 2: Inyectar texto en el prompt evaluador
+        prompt = f'''Analiza el siguiente texto que es la transcripción de un video de YouTube:
+
+<TRANSCRIPCION>
+{transcript_text}
+</TRANSCRIPCION>
+
+Eres un profesor universitario experto, sumamente analítico y riguroso. Tu objetivo es CALIFICAR al estudiante basándote en los 6 criterios estáticos de la universidad.
+Debes rellenar los puntajes y la retroalimentación para cada uno de los 6 criterios que se te entregan en el formato JSON.
+
+INSTRUCCIONES CRÍTICAS, ESTRICTAS Y OBLIGATORIAS:
+1. TIENES PROHIBIDO INVENTAR CRITERIOS O CAMBIAR LOS NOMBRES. Los 6 criterios son ESTÁTICOS e INAMOVIBLES.
+2. Escribe TODA tu respuesta ÚNICAMENTE en Español.
+3. Para cada criterio, elige UNA de las notas permitidas, justifica tu puntuación, lista errores específicos (citas exactas del estudiante) y destaca fortalezas.
+4. Debes devolver ÚNICAMENTE un objeto JSON válido, copiando EXACTAMENTE la estructura de abajo y rellenando los campos indicados con corchetes [ ].
+
+Usa EXACTAMENTE este formato:
+
+```json
+{{
+    "transcript": "[Texto completo de la transcripción de voz extraída]",
+    "vocabulary_detected": ["palabra1", "palabra2"],
+    "vocabulary_missing": ["palabra3", "palabra4"],
+    "criteria": [
+      {{ 
+        "name": "1. Elaboration of contents", 
+        "score": [ELIGE UNO: 4, 3, 2, 1, 0], 
+        "max": 4, 
+        "feedback": {{
+           "justification": "[Párrafo detallado explicando por qué el contenido responde o no a las indicaciones de la actividad.]",
+           "errors": ["Error específico 1", "Error 2"],
+           "strengths": ["Fortaleza 1", "Fortaleza 2"]
+        }}
+      }},
+      {{ 
+        "name": "2. Use of grammar", 
+        "score": [ELIGE UNO: 3.5, 2.5, 1.5, 0.5, 0], 
+        "max": 3.5, 
+        "feedback": {{
+           "justification": "[Párrafo detallado sobre el uso de gramática sin errores.]",
+           "errors": [],
+           "strengths": []
+        }}
+      }},
+      {{ 
+        "name": "3. Use of vocabulary", 
+        "score": [ELIGE UNO: 3.5, 2.5, 1.5, 0.5, 0], 
+        "max": 3.5, 
+        "feedback": {{
+           "justification": "[Párrafo detallado sobre el uso del vocabulario de la unidad sin errores.]",
+           "errors": [],
+           "strengths": []
+        }}
+      }},
+      {{ 
+        "name": "4. Use of pronunciation and intonation", 
+        "score": [ELIGE UNO: 5, 3.5, 2, 0.5, 0], 
+        "max": 5, 
+        "feedback": {{
+           "justification": "[Párrafo detallado sobre pronunciación, entonación y si el mensaje se entiende a pesar de errores.]",
+           "errors": [],
+           "strengths": []
+        }}
+      }},
+      {{ 
+        "name": "5. Oral presentation", 
+        "score": [ELIGE UNO: 2, 1.5, 1, 0.5, 0], 
+        "max": 2, 
+        "feedback": {{
+           "justification": "[Párrafo detallado sobre si mira a la cámara y no depende de sus notas.]",
+           "errors": [],
+           "strengths": []
+        }}
+      }},
+      {{ 
+        "name": "6. Delivery of speech/dialogue", 
+        "score": [ELIGE UNO: 2, 1.5, 1, 0.5, 0], 
+        "max": 2, 
+        "feedback": {{
+           "justification": "[Párrafo detallado sobre si vocaliza con un volumen de voz audible.]",
+           "errors": [],
+           "strengths": []
+        }}
+      }}
+    ]
+}}
+```
+SOLO DEVUELVE EL JSON. NO añadas introducciones, ni saludos, ni notas finales. Si un array como errors o strengths está vacío, envíalo como [].
+'''
+        
+        process = await asyncio.create_subprocess_exec(
+            "hermes", "-s", "youtube-content", "-z", prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        out = stdout.decode('utf-8')
+        err = stderr.decode('utf-8')
+        print(f"HERMES OUT: {out}", flush=True)
+        print(f"HERMES ERR: {err}", flush=True)
+        
+        import json
+        import re
+        
+        try:
+            match = re.search(r'```json\s*(.*?)\s*```', out, re.DOTALL)
+            if not match:
+                # Fallback: maybe it just outputted the JSON directly without the markdown wrapper
+                match_fallback = re.search(r'\{.*\}', out, re.DOTALL)
+                if match_fallback:
+                    out = match_fallback.group(0)
+                    # We create a fake match object so the next block works
+                    class FakeMatch:
+                        def group(self, idx): return out
+                    match = FakeMatch()
+            if match:
+                json_str = match.group(1)
+            else:
+                start_idx = out.find('{')
+                end_idx = out.rfind('}')
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    json_str = out[start_idx:end_idx+1]
+                else:
+                    raise ValueError("No JSON object found in output")
+                    
+            data = json.loads(json_str)
+            # Detectar si la IA indicó que YouTube bloqueó el acceso
+            if "bloque" in str(data.get("transcript", "")).lower() or "blocked" in str(data.get("transcript", "")).lower() or "captcha" in str(data.get("transcript", "")).lower():
+                return JSONResponse({"error": "YouTube ha bloqueado temporalmente el acceso desde el servidor (CAPTCHA/IP Block). Inténtalo más tarde con este video o usa otro.", "raw": out}, status_code=422)
+            
+            return JSONResponse({"result": data})
+        except json.JSONDecodeError:
+            pass
+        except ValueError:
+            pass
+        
+        return JSONResponse({"error": "No se pudo generar JSON válido.", "raw": out}, status_code=422)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+async def api_status(request: Request):
+    if err := guard(request): return err
+    data = read_env(ENV_FILE)
+    providers = {
+        k.replace("_API_KEY","").replace("_TOKEN","").replace("HF_","HuggingFace ").replace("_"," ").title():
+        {"configured": bool(data.get(k))}
+        for k in PROVIDER_KEYS
+    }
+    channels = {
+        name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
+        for name, key in CHANNEL_MAP.items()
+    }
+    return JSONResponse({"gateway": gw.status(), "providers": providers, "channels": channels})
+
+
+async def api_logs(request: Request):
+    if err := guard(request): return err
+    return JSONResponse({"lines": list(gw.logs)})
+
+
+async def api_gw_start(request: Request):
+    if err := guard(request): return err
+    asyncio.create_task(gw.start())
+    return JSONResponse({"ok": True})
+
+
+async def api_gw_stop(request: Request):
+    if err := guard(request): return err
+    asyncio.create_task(gw.stop())
+    return JSONResponse({"ok": True})
+
+
+async def api_gw_restart(request: Request):
+    if err := guard(request): return err
+    asyncio.create_task(gw.restart())
+    return JSONResponse({"ok": True})
+
+
+async def api_config_reset(request: Request):
+    if err := guard(request): return err
+    asyncio.create_task(gw.stop())
+    async with cfg_lock:
+        if ENV_FILE.exists():
+            ENV_FILE.unlink()
+        write_config_yaml({})
+    return JSONResponse({"ok": True})
+
+
+async def api_test_provider(request: Request):
+    """POST /setup/api/test-provider — verify a provider API key before saving.
+
+    Accepts {"env_key": "OPENROUTER_API_KEY", "key": "<value or masked>"}.
+    If the key value ends with *** (masked by the UI), the stored .env value
+    is used instead so users can re-test a previously saved key without
+    having to re-enter it.
+    """
+    if err := guard(request): return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    env_key   = str(body.get("env_key", ""))
+    key_value = str(body.get("key", ""))
+
+    if env_key not in PROVIDER_TEST_CONFIGS:
+        return JSONResponse({"error": "No test available for this provider"}, status_code=400)
+
+    # Masked values end with *** — resolve the real key from the stored .env.
+    if not key_value or key_value.endswith("***"):
+        key_value = read_env(ENV_FILE).get(env_key, "")
+
+    if not key_value:
+        return JSONResponse({"ok": False, "error": "No API key configured"})
+
+    # Just test the first key in the comma-separated list
+    if "," in key_value:
+        key_value = [k.strip() for k in key_value.split(",") if k.strip()][0]
+
+    cfg = PROVIDER_TEST_CONFIGS[env_key]
+    try:
+        headers = {}
+        if cfg["auth"] == "x-goog-api-key":
+            headers["x-goog-api-key"] = key_value
+        else:
+            headers["Authorization"] = f"{cfg['auth']} {key_value}"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                cfg["url"],
+                headers=headers,
+            )
+        if 200 <= resp.status_code < 300:
+            return JSONResponse({"ok": True})
+        elif resp.status_code in (401, 403):
+            return JSONResponse({"ok": False, "error": f"Key rejected by provider (HTTP {resp.status_code})"})
+        elif resp.status_code == 429:
+            # Rate-limited but authenticated — key is valid.
+            return JSONResponse({"ok": True, "note": "Rate limited, but key is valid"})
+        else:
+            return JSONResponse({"ok": False, "error": f"Provider returned HTTP {resp.status_code}"})
+    except httpx.TimeoutException:
+        return JSONResponse({"ok": False, "error": "Request timed out (10s)"})
+    except httpx.RequestError as exc:
+        return JSONResponse({"ok": False, "error": f"Network error: {exc}"})
+
+
+# ── Pairing ───────────────────────────────────────────────────────────────────
+def _pjson(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text()) if path.exists() else {}
+    except Exception:
+        return {}
+
+
+def _wjson(path: Path, data: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    try: os.chmod(path, 0o600)
+    except OSError: pass
+
+
+def _platforms(suffix: str) -> list[str]:
+    if not PAIRING_DIR.exists(): return []
+    return [f.stem.rsplit(f"-{suffix}", 1)[0] for f in PAIRING_DIR.glob(f"*-{suffix}.json")]
+
+
+async def api_pairing_pending(request: Request):
+    if err := guard(request): return err
+    now = time.time()
+    out = []
+    for p in _platforms("pending"):
+        for code, info in _pjson(PAIRING_DIR / f"{p}-pending.json").items():
+            if now - info.get("created_at", now) <= PAIRING_TTL:
+                out.append({"platform": p, "code": code,
+                            "user_id": info.get("user_id",""), "user_name": info.get("user_name",""),
+                            "age_minutes": int((now - info.get("created_at", now)) / 60)})
+    return JSONResponse({"pending": out})
+
+
+async def api_pairing_approve(request: Request):
+    if err := guard(request): return err
+    try: body = await request.json()
+    except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    platform, code = body.get("platform",""), body.get("code","").upper().strip()
+    if not platform or not code:
+        return JSONResponse({"error": "platform and code required"}, status_code=400)
+    pending_path = PAIRING_DIR / f"{platform}-pending.json"
+    pending = _pjson(pending_path)
+    if code not in pending:
+        return JSONResponse({"error": "Code not found"}, status_code=404)
+    entry = pending.pop(code)
+    _wjson(pending_path, pending)
+    approved = _pjson(PAIRING_DIR / f"{platform}-approved.json")
+    approved[entry["user_id"]] = {"user_name": entry.get("user_name",""), "approved_at": time.time()}
+    _wjson(PAIRING_DIR / f"{platform}-approved.json", approved)
+    return JSONResponse({"ok": True})
+
+
+async def api_pairing_deny(request: Request):
+    if err := guard(request): return err
+    try: body = await request.json()
+    except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    platform, code = body.get("platform",""), body.get("code","").upper().strip()
+    p = PAIRING_DIR / f"{platform}-pending.json"
+    pending = _pjson(p)
+    if code in pending:
+        del pending[code]
+        _wjson(p, pending)
+    return JSONResponse({"ok": True})
+
+
+async def api_pairing_approved(request: Request):
+    if err := guard(request): return err
+    out = []
+    for p in _platforms("approved"):
+        for uid, info in _pjson(PAIRING_DIR / f"{p}-approved.json").items():
+            out.append({"platform": p, "user_id": uid,
+                        "user_name": info.get("user_name",""), "approved_at": info.get("approved_at",0)})
+    return JSONResponse({"approved": out})
+
+
+async def api_pairing_revoke(request: Request):
+    if err := guard(request): return err
+    try: body = await request.json()
+    except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    platform, uid = body.get("platform",""), body.get("user_id","")
+    if not platform or not uid:
+        return JSONResponse({"error": "platform and user_id required"}, status_code=400)
+    p = PAIRING_DIR / f"{platform}-approved.json"
+    approved = _pjson(p)
+    if uid in approved:
+        del approved[uid]
+        _wjson(p, approved)
+    return JSONResponse({"ok": True})
+
+
+async def api_wa_pair_start(request: Request):
+    global WA_PAIRING_PROCESS
+    if err := guard(request): return err
+    
+    if WA_PAIRING_PROCESS and WA_PAIRING_PROCESS.poll() is None:
+        try: WA_PAIRING_PROCESS.terminate()
+        except: pass
+        
+    bridge_script = "/opt/hermes-agent/scripts/whatsapp-bridge/bridge.js"
+    session_dir = Path(HERMES_HOME) / "platforms" / "whatsapp" / "session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    
+    bridge_dir = Path(bridge_script).parent
+    
+    log_file = open("/tmp/wa-pairing.log", "w", encoding="utf-8")
+    log_file.write("Starting WhatsApp pairing (please wait for QR code)...\n")
+    log_file.flush()
+    
+    env = os.environ.copy()
+    WA_PAIRING_PROCESS = subprocess.Popen(
+        ["node", bridge_script, "--pair-only", "--session", str(session_dir)],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env
+    )
+    return JSONResponse({"ok": True})
+
+
+async def api_wa_pair_logs(request: Request):
+    if err := guard(request): return err
+    try:
+        content = Path("/tmp/wa-pairing.log").read_text(encoding="utf-8")
+    except Exception:
+        content = ""
+    
+    running = False
+    if WA_PAIRING_PROCESS and WA_PAIRING_PROCESS.poll() is None:
+        running = True
+        
+    return JSONResponse({"logs": content, "running": running})
+
+async def api_wa_pair_reset(request: Request):
+    global WA_PAIRING_PROCESS
+    if err := guard(request): return err
+    
+    if WA_PAIRING_PROCESS and WA_PAIRING_PROCESS.poll() is None:
+        try: WA_PAIRING_PROCESS.terminate()
+        except: pass
+        
+    session_dir = Path(HERMES_HOME) / "platforms" / "whatsapp" / "session"
+    if session_dir.exists():
+        import shutil
+        try:
+            shutil.rmtree(session_dir)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+            
+    Path("/tmp/wa-pairing.log").unlink(missing_ok=True)
+    return JSONResponse({"ok": True})
+
+
+# ── Reverse proxy → Hermes dashboard ──────────────────────────────────────────
+_WIDGET_LINK_STYLE = (
+    "background:rgba(20,24,31,0.92);backdrop-filter:blur(8px);"
+    "border:1px solid #252d3d;border-radius:6px;padding:6px 12px;"
+    "color:#c9d1d9;text-decoration:none;display:inline-flex;"
+    "align-items:center;gap:6px;"
+)
+BACK_TO_SETUP_WIDGET = (
+    '<div id="hermes-back-widget" style="position:fixed;top:14px;right:14px;'
+    'z-index:99999;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;'
+    'font-size:11px;display:flex;gap:8px;">'
+    f'<a href="/setup" style="{_WIDGET_LINK_STYLE}">← Setup</a>'
+    f'<a href="/logout" style="{_WIDGET_LINK_STYLE}">Sign out</a>'
+    '</div>'
+)
+
+DASHBOARD_UNAVAILABLE_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Dashboard starting…</title>
+<style>body{background:#0d0f14;color:#c9d1d9;font-family:ui-monospace,Menlo,monospace;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:480px;padding:32px;border:1px solid #252d3d;border-radius:12px;
+background:#14181f;text-align:center}
+h1{font-size:16px;color:#d29922;margin:0 0 12px;font-weight:600}
+p{font-size:13px;color:#6b7688;line-height:1.6;margin:0 0 16px}
+a{color:#6272ff;text-decoration:none;border:1px solid #252d3d;border-radius:6px;
+padding:7px 14px;font-size:12px;display:inline-block}
+a:hover{border-color:#6272ff}</style></head>
+<body><div class="card">
+<h1>⚠ Hermes dashboard unavailable</h1>
+<p>The native Hermes dashboard is not responding on port %d.<br>
+It may still be starting up, or it may have crashed.</p>
+<p>Try refreshing in a few seconds, or head back to setup.</p>
+<a href="/setup">← Back to Setup</a>
+</div>
+<script>setTimeout(()=>location.reload(),4000);</script>
+</body></html>""" % HERMES_DASHBOARD_PORT
+
+
+async def _proxy_to_dashboard(request: Request) -> Response:
+    """Forward an authenticated request to the Hermes dashboard subprocess.
+
+    Assumes edge auth (basic auth middleware) has already validated the caller.
+    HTTP-only: the native Hermes dashboard does not use WebSockets.
+    """
+    client = get_http_client()
+    target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+
+    req_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    body = await request.body()
+
+    try:
+        upstream = await client.request(
+            request.method,
+            target,
+            headers=req_headers,
+            content=body,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
+    except httpx.RequestError as e:
+        print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
+        return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
+
+    # Surface non-2xx responses from hermes into Railway logs so we can
+    # diagnose 401/500s without needing browser DevTools access.
+    if upstream.status_code >= 400:
+        body_snip = upstream.content[:200].decode("utf-8", errors="replace")
+        print(
+            f"[proxy] {request.method} {request.url.path} -> {upstream.status_code} "
+            f"body={body_snip!r}",
+            flush=True,
+        )
+
+    # Strip hop-by-hop and length/encoding headers — Starlette recomputes them.
+    resp_headers = {
+        k: v for k, v in upstream.headers.items()
+        if k.lower() not in HOP_BY_HOP
+        and k.lower() not in ("content-encoding", "content-length")
+    }
+
+    content = upstream.content
+    content_type = upstream.headers.get("content-type", "").lower()
+
+    # Inject the "← Setup" widget into HTML pages so users can always return.
+    if "text/html" in content_type and b"</body>" in content:
+        try:
+            text = content.decode("utf-8", errors="replace")
+            text = text.replace("</body>", BACK_TO_SETUP_WIDGET + "</body>", 1)
+            content = text.encode("utf-8")
+        except Exception:
+            pass  # on any error, fall back to raw upstream content
+
+    return Response(
+        content=content,
+        status_code=upstream.status_code,
+        headers=resp_headers,
+    )
+
+
+async def route_root(request: Request) -> Response:
+    """GET /: first-visit smart redirect, otherwise proxy to the dashboard.
+
+    - Unconfigured + bare GET `/` → bounce to `/setup` so new users land on
+      the wizard instead of a half-empty dashboard.
+    - Sidebar / in-app links pass `?force=1` to opt out of that redirect —
+      users who explicitly want the dashboard (e.g. to set providers via
+      the Keys tab) can still reach it without saving config first.
+    - Non-GET (SPA API calls, etc.) always proxy through.
+    """
+    if err := guard(request): return err
+    if (request.method == "GET"
+            and request.query_params.get("force") != "1"
+            and not is_config_complete()):
+        return RedirectResponse("/setup", status_code=302)
+    return await _proxy_to_dashboard(request)
+
+
+async def route_proxy(request: Request) -> Response:
+    """Catch-all: forward any unmatched path to the Hermes dashboard."""
+    if err := guard(request): return err
+    return await _proxy_to_dashboard(request)
+
+
+async def route_setup_404(request: Request) -> Response:
+    """Typos under /setup/* should 404 here — not fall through to the proxy."""
+    if err := guard(request): return err
+    return Response("Not Found", status_code=404, media_type="text/plain")
+
+
+# ── App lifecycle ─────────────────────────────────────────────────────────────
+async def auto_start():
+    if is_config_complete():
+        asyncio.create_task(gw.start())
+    else:
+        print("[server] Config incomplete — gateway not started. Configure provider + model in the admin UI.", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Dashboard runs always — it's the user-facing UI after setup is done,
+    # and it's independent of gateway state.
+    asyncio.create_task(dash.start())
+    await auto_start()
+    try:
+        yield
+    finally:
+        await asyncio.gather(
+            gw.stop(),
+            dash.stop(),
+            return_exceptions=True,
+        )
+        global _http_client
+        if _http_client is not None:
+            await _http_client.aclose()
+            _http_client = None
+
+
+async def websocket_proxy(websocket: WebSocket):
+    await websocket.accept()
+    path = websocket.path_params.get("path", "")
+    target_url = f"ws://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}/{path}"
+    if websocket.url.query:
+        target_url += f"?{websocket.url.query}"
+    
+    import websockets
+    try:
+        async with websockets.connect(target_url) as upstream:
+            async def up_to_down():
+                try:
+                    async for message in upstream:
+                        if isinstance(message, str):
+                            await websocket.send_text(message)
+                        else:
+                            await websocket.send_bytes(message)
+                except Exception:
+                    pass
+
+            async def down_to_up():
+                try:
+                    while True:
+                        message = await websocket.receive()
+                        if message["type"] == "websocket.disconnect":
+                            break
+                        if "text" in message:
+                            await upstream.send(message["text"])
+                        elif "bytes" in message:
+                            await upstream.send(message["bytes"])
+                except Exception:
+                    pass
+
+            await asyncio.gather(up_to_down(), down_to_up())
+    except Exception as e:
+        print(f"[proxy] websocket error for {path}: {e}", flush=True)
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+
+routes = [
+    # Public — no auth required.
+    Route("/health",                            route_health),
+    Route("/login",                             page_login,          methods=["GET"]),
+    Route("/login",                             login_post,          methods=["POST"]),
+    Route("/logout",                            logout),
+
+    # Our setup wizard + management API, all under /setup/* (cookie-auth guarded).
+    Route("/setup",                             page_index),
+    Route("/setup/",                            page_index),
+    Route("/setup/api/config",                  api_config_get,      methods=["GET"]),
+    Route("/setup/api/config",                  api_config_put,      methods=["PUT"]),
+    
+    # --- PROXY ROUTES ---
+    Route("/proxy/gemini/{path:path}",          openai_proxy,        methods=["GET", "POST", "OPTIONS"]),
+    Route("/proxy/openrouter/{path:path}",      openrouter_proxy,    methods=["GET", "POST", "OPTIONS"]),
+    
+    Route("/setup/api/hermes/evaluate", api_hermes_evaluate, methods=["POST"]),
+    Route("/setup/api/hermes/chat", api_hermes_chat, methods=["POST"]),
+    Route("/setup/api/status",                  api_status),
+    Route("/setup/api/logs",                    api_logs),
+    Route("/setup/api/gateway/start",           api_gw_start,        methods=["POST"]),
+    Route("/setup/api/gateway/stop",            api_gw_stop,         methods=["POST"]),
+    Route("/setup/api/gateway/restart",         api_gw_restart,      methods=["POST"]),
+    Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
+    Route("/setup/api/test-provider",           api_test_provider,   methods=["POST"]),
+    Route("/setup/api/pairing/pending",         api_pairing_pending),
+    Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),
+    Route("/setup/api/pairing/deny",            api_pairing_deny,    methods=["POST"]),
+    Route("/setup/api/pairing/approved",        api_pairing_approved),
+    Route("/setup/api/pairing/revoke",          api_pairing_revoke,  methods=["POST"]),
+    Route("/setup/api/whatsapp/pair/start",     api_wa_pair_start,   methods=["POST"]),
+    Route("/setup/api/whatsapp/pair/logs",      api_wa_pair_logs),
+    Route("/setup/api/whatsapp/pair/reset",     api_wa_pair_reset,   methods=["POST"]),
+
+    # /setup/* typos return a real 404 — not a silent proxy fallthrough.
+    Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
+
+    # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
+    Route("/",                                  route_root,          methods=ANY_METHOD),
+
+    # Catch-all: everything else proxies to the Hermes dashboard subprocess.
+    Route("/{path:path}",                       route_proxy,         methods=ANY_METHOD),
+    WebSocketRoute("/{path:path}",              websocket_proxy),
+]
+
+# No middleware — auth is enforced per-handler via guard(). This keeps /health
+# and /login truly unauthenticated without middleware gymnastics.
+app = Starlette(routes=routes, lifespan=lifespan)
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8080"))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", loop="asyncio")
+    server = uvicorn.Server(config)
+
+    def _shutdown():
+        loop.create_task(gw.stop())
+        loop.create_task(dash.stop())
+        server.should_exit = True
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _shutdown)
+
+    loop.run_until_complete(server.serve())
