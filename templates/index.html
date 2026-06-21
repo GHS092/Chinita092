@@ -1500,6 +1500,24 @@
                   </template>
                </div>
             </div>
+            
+            <!-- Consolidado Blackboard -->
+            <div style="margin-top: 32px; background: rgba(15,23,42,0.8); border: 1px solid #f59e0b; border-radius: 12px; padding: 24px;">
+               <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px;">
+                  <div>
+                     <h3 style="margin: 0 0 8px 0; color: #f59e0b; font-size: 18px; display: flex; align-items: center; gap: 8px;">
+                        <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
+                        Consolidado para Blackboard / UTP +class
+                     </h3>
+                     <div style="color: #94a3b8; font-size: 13px;">Pega la rúbrica estructurada y retroalimentación con un solo clic.</div>
+                  </div>
+                  <button @click="copyConsolidado" style="background: #d97706; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='#b45309'" onmouseout="this.style.background='#d97706'">
+                     Copiar Calificación
+                  </button>
+               </div>
+               <textarea readonly :value="generateConsolidado()" style="width: 100%; height: 350px; background: #000; color: #f8fafc; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; padding: 16px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.6; resize: vertical; outline: none;"></textarea>
+            </div>
+
           </div>
           </template>
         </div>
@@ -2176,6 +2194,78 @@ getScoreOptions(maxVal) {
             opts.push(Number(i.toFixed(1)));
         }
         return opts;
+      },
+      generateConsolidado() {
+          const res = this.hermesState.result;
+          if (!res) return '';
+          
+          let date = new Date().toLocaleDateString('es-ES', { day: 'numeric', month: 'long', year: 'numeric' });
+          let out = `=========================================\n`;
+          out += `UTP +class - RETROALIMENTACIÓN DE SPEAKING\n`;
+          out += `=========================================\n`;
+          out += `Estudiante: [Escribir Nombre]\n`;
+          out += `Fecha: ${date}\n`;
+          out += `Puntaje Obtenido: ${this.calculateTotalScore(res)} / ${this.calculateMaxScore(res)} puntos\n\n`;
+          
+          out += `--- CALIFICACIÓN POR CRITERIO ---\n`;
+          res.criteria.forEach(c => {
+              let name = c.name.replace(/^\d+\.\s*/, '');
+              out += `- ${name}: ${c.score} / ${c.max} pts\n`;
+          });
+          
+          out += `\n--- FORTALEZAS (Strengths) ---\n`;
+          let allStrengths = [];
+          res.criteria.forEach(c => {
+              if (c.feedback.strengths && c.feedback.strengths.length > 0) {
+                  allStrengths = allStrengths.concat(c.feedback.strengths);
+              }
+          });
+          if (allStrengths.length > 0) {
+              out += allStrengths.map(s => `• ${s}`).join('\n') + '\n';
+          } else {
+              out += `No se encontraron fortalezas específicas.\n`;
+          }
+          
+          out += `\n--- RECOMENDACIONES (Improvements) ---\n`;
+          res.criteria.forEach(c => {
+              let name = c.name.replace(/^\d+\.\s*/, '');
+              if (c.feedback.justification) {
+                  out += `${name}: ${c.feedback.justification}\n`;
+              }
+          });
+          
+          out += `\n--- ERRORES GRAMATICALES CLAVE ---\n`;
+          let allErrors = [];
+          res.criteria.forEach(c => {
+              if (c.feedback.errors && c.feedback.errors.length > 0) {
+                  allErrors = allErrors.concat(c.feedback.errors);
+              }
+          });
+          if (allErrors.length > 0) {
+              allErrors.forEach((err, i) => {
+                  out += `${i+1}. Error: ${err}\n`;
+              });
+          } else {
+              out += `Ninguno detectado.\n`;
+          }
+          
+          out += `\n--- EVALUACIÓN DE VOCABULARIO CLAVE ---\n`;
+          let vDet = res.vocabulary_detected || [];
+          let vMiss = res.vocabulary_missing || [];
+          out += `✔ Utilizado: ${vDet.length > 0 ? vDet.join(', ') : 'Ninguno'}\n`;
+          out += `✘ Faltó incorporar: ${vMiss.length > 0 ? vMiss.join(', ') : 'Ninguno'}\n`;
+          
+          out += `\n--- COMENTARIO DE CIERRE ---\n`;
+          out += `Sigue practicando tu pronunciación e interacción para mantener un alto nivel académico.\n`;
+          out += `=========================================`;
+          
+          return out;
+      },
+      copyConsolidado() {
+          const text = this.generateConsolidado();
+          navigator.clipboard.writeText(text).then(() => {
+              alert('Consolidado copiado al portapapeles. ¡Listo para pegar en Blackboard!');
+          });
       },
       async evaluateVideo() {
         if(!this.hermesState.url) return;
