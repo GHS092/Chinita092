@@ -47,30 +47,81 @@ def format_timestamp(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def fetch_transcript(video_id: str, languages: list = None):
-    """Fetch transcript segments from YouTube.
+import random
+import urllib.request
 
-    Returns a list of dicts with 'text', 'start', and 'duration' keys.
-    Compatible with youtube-transcript-api v1.x.
-    """
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1"
+]
+
+def fetch_proxies():
+    try:
+        req = urllib.request.Request(
+            'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=US&ssl=yes&anonymity=elite',
+            headers={'User-Agent': random.choice(USER_AGENTS)}
+        )
+        res = urllib.request.urlopen(req, timeout=5).read().decode('utf-8')
+        proxies = [p.strip() for p in res.split('\n') if p.strip()]
+        random.shuffle(proxies)
+        return proxies[:10]
+    except:
+        return []
+
+def fetch_transcript(video_id: str, languages: list = None):
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except ImportError:
-        print("Error: youtube-transcript-api not installed. Run: pip install youtube-transcript-api",
-              file=sys.stderr)
+        print("Error: youtube-transcript-api not installed. Run: pip install youtube-transcript-api", file=sys.stderr)
         sys.exit(1)
 
-    api = YouTubeTranscriptApi()
-    if languages:
-        result = api.fetch(video_id, languages=languages)
-    else:
-        result = api.fetch(video_id)
-
-    # v1.x returns FetchedTranscriptSnippet objects; normalize to dicts
-    return [
-        {"text": seg.text, "start": seg.start, "duration": seg.duration}
-        for seg in result
-    ]
+    # Intento 1: Directo con rotación de User-Agent (puede fallar si Railway esta baneado)
+    import requests
+    try:
+        session = requests.Session()
+        session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+        api = YouTubeTranscriptApi(http_client=session)
+        if languages:
+            result = api.fetch(video_id, languages=languages)
+        else:
+            result = api.fetch(video_id)
+        return [{"text": seg.text, "start": seg.start, "duration": seg.duration} for seg in result]
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "blocking requests from your ip" not in error_msg and "too many requests" not in error_msg:
+            raise e # Es un error real (no tiene subs, esta desactivado, etc)
+        
+        # BAN DETECTADO: Usamos nuestra magia de proxies rotativos
+        proxies_list = fetch_proxies()
+        if not proxies_list:
+            raise Exception("IP de Railway baneada por YouTube y falló la extracción de proxies de rescate.")
+        
+        import requests
+        last_err = e
+        for proxy in proxies_list:
+            proxy_dict = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+            session = requests.Session()
+            session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+            session.proxies.update(proxy_dict)
+            
+            try:
+                api = YouTubeTranscriptApi(http_client=session)
+                if languages:
+                    result = api.fetch(video_id, languages=languages)
+                else:
+                    result = api.fetch(video_id)
+                return [{"text": seg.text, "start": seg.start, "duration": seg.duration} for seg in result]
+            except Exception as proxy_e:
+                error_msg_proxy = str(proxy_e).lower()
+                # Si falló por proxy malo o baneado, intentamos el siguiente
+                if "blocking requests" in error_msg_proxy or "proxy" in error_msg_proxy or "timeout" in error_msg_proxy or "connection" in error_msg_proxy or "too many requests" in error_msg_proxy:
+                    last_err = proxy_e
+                    continue
+                raise proxy_e # Otro error real
+                
+        raise Exception(f"Fallo al evadir el baneo IP de YouTube tras intentar con {len(proxies_list)} proxies. Último error: {last_err}")
 
 
 def main():
