@@ -2213,26 +2213,7 @@ getScoreOptions(maxVal) {
               out += `- ${name}: ${c.score} / ${c.max} pts\n`;
           });
           
-          out += `\n--- FORTALEZAS (Strengths) ---\n`;
-          let allStrengths = [];
-          res.criteria.forEach(c => {
-              if (c.feedback.strengths && c.feedback.strengths.length > 0) {
-                  allStrengths = allStrengths.concat(c.feedback.strengths);
-              }
-          });
-          if (allStrengths.length > 0) {
-              out += allStrengths.map(s => `• ${s}`).join('\n') + '\n';
-          } else {
-              out += `No se encontraron fortalezas específicas.\n`;
-          }
-          
-          out += `\n--- RECOMENDACIONES (Improvements) ---\n`;
-          res.criteria.forEach(c => {
-              let name = c.name.replace(/^\d+\.\s*/, '');
-              if (c.feedback.justification) {
-                  out += `${name}: ${c.feedback.justification}\n`;
-              }
-          });
+
           
           out += `\n--- ERRORES GRAMATICALES CLAVE ---\n`;
           let allErrors = [];
