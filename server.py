@@ -47,6 +47,8 @@ from starlette.responses import (
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 from starlette.templating import Jinja2Templates
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -1566,7 +1568,11 @@ routes = [
 
 # No middleware — auth is enforced per-handler via guard(). This keeps /health
 # and /login truly unauthenticated without middleware gymnastics.
-app = Starlette(routes=routes, lifespan=lifespan)
+# Wait, we added CORSMiddleware so the Chrome extension can communicate.
+middleware = [
+    Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+]
+app = Starlette(routes=routes, lifespan=lifespan, middleware=middleware)
 
 if __name__ == "__main__":
     import uvicorn
