@@ -1055,6 +1055,52 @@ SOLO DEVUELVE EL JSON. NO añadas introducciones, ni saludos, ni notas finales. 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+import io
+async def api_hermes_evaluate_file(request: Request):
+    try:
+        form = await request.form()
+        file = form.get("file")
+        if not file:
+            return JSONResponse({"error": "No file provided"}, status_code=400)
+            
+        filename = file.filename.lower()
+        file_bytes = await file.read()
+        
+        extracted_text = ""
+        
+        if filename.endswith(".pdf"):
+            import PyPDF2
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            for page in pdf_reader.pages:
+                text = page.extract_text()
+                if text: extracted_text += text + "\n"
+        elif filename.endswith(".docx"):
+            import docx
+            doc = docx.Document(io.BytesIO(file_bytes))
+            for para in doc.paragraphs:
+                extracted_text += para.text + "\n"
+        else:
+            return JSONResponse({"error": "Unsupported file format. Must be PDF or DOCX."}, status_code=400)
+            
+        import re
+        youtube_regex = r'https:\/\/(?:www\.)?youtu(?:\.be\/|be\.com\/watch\?v=)([\w-]+)'
+        match = re.search(youtube_regex, extracted_text, re.IGNORECASE)
+        
+        if not match:
+            return JSONResponse({"error": "No YouTube link found in the document."}, status_code=422)
+            
+        youtube_url = match.group(0)
+        
+        # Proxy to the standard evaluate API internally
+        class FakeRequest:
+            async def json(self):
+                return {"url": youtube_url, "rubric": form.get("rubric", "")}
+                
+        return await api_hermes_evaluate(FakeRequest())
+        
+    except Exception as e:
+        return JSONResponse({"error": f"Error parsing file: {str(e)}"}, status_code=500)
+
 async def api_status(request: Request):
     if err := guard(request): return err
     data = read_env(ENV_FILE)
@@ -1537,8 +1583,10 @@ routes = [
     Route("/proxy/gemini/{path:path}",          openai_proxy,        methods=["GET", "POST", "OPTIONS"]),
     Route("/proxy/openrouter/{path:path}",      openrouter_proxy,    methods=["GET", "POST", "OPTIONS"]),
     
-    Route("/setup/api/hermes/evaluate", api_hermes_evaluate, methods=["POST"]),
-    Route("/setup/api/hermes/chat", api_hermes_chat, methods=["POST"]),
+    Route("/setup/api/hermes/evaluate",         api_hermes_evaluate, methods=["POST"]),
+    Route("/setup/api/hermes/evaluate-file",    api_hermes_evaluate_file, methods=["POST"]),
+    Route("/setup/api/hermes/chat",             api_hermes_chat, methods=["POST"]),
+    Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),
     Route("/setup/api/status",                  api_status),
     Route("/setup/api/logs",                    api_logs),
     Route("/setup/api/gateway/start",           api_gw_start,        methods=["POST"]),
